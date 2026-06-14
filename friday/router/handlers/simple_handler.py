@@ -1,38 +1,83 @@
 """
-Tier 2A — Simple Handler
-=========================
-Handles SIMPLE queries entirely with direct SQLite + in-memory lookup.
-NO LLM call. Target latency: <200ms.
+Tier 2A — Simple Handler (UPGRADED)
+=====================================
+PREVIOUSLY: Zero LLM calls. Hardcoded template responses. No memory access.
+NOW: Every response is context-aware and personalized.
 
-Connected to REAL project tables:
-  - facts          (calendar / temporal events)
-  - user_profile   (via UserPersonalization)
+The SimpleHandler now accepts a ContextBundle from the SmartRouter.
+The bundle contains:
+  - Semantic memory search results (what Friday remembers about you)
+  - Your calendar itinerary
+  - Reminders for upcoming events
+  - Scheduling conflict warnings
+  - Your full profile (name, preferences, occupation, etc.)
+
+For CALENDAR_QUERY, FACT_RECALL, TEMPORAL_FACT — still uses direct SQLite
+(fast, no LLM needed — data is structured and complete in the DB).
+
+For GREETING and GENERAL_CHAT — now makes a lightweight LLM call using
+the full context bundle, so even a casual "hey" gets a genuinely
+personalized, memory-aware response instead of "Noted, Sir."
+
+Target latency:
+  Structured queries (calendar/facts): <200ms (no LLM, just SQLite)
+  Greeting / general chat:             <1s    (LLM with bundle context)
 """
 
 import logging
 import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from friday.memory.context_assembler import ContextBundle
 
 logger = logging.getLogger(__name__)
+
+# Minimal system prompt for the Simple-tier LLM call.
+# Full profile + memory context is injected via the bundle.
+_SIMPLE_SYSTEM = (
+    "You are Friday, a highly intelligent, formal, and concise personal AI assistant "
+    "with persistent memory. Answer in 1-2 sentences maximum. "
+    "Use the provided context to give a personalized, memory-aware response. "
+    "Never mention tags, tools, or that you are an AI. "
+    "Address the user by name if their name is known from the profile."
+)
 
 
 class SimpleHandler:
     """
-    Handles SIMPLE tier queries without any LLM call.
-    Injected with the real db_manager and personalization objects from terminal_chat.py.
+    Handles SIMPLE tier queries.
+    Now accepts a ContextBundle and uses it for personalized responses.
+
+    For structured queries (calendar, facts): direct SQLite — no LLM, <200ms.
+    For conversational queries (greeting, chat): LLM + full context bundle.
     """
 
-    def __init__(self, db_manager, personalization, searcher=None):
-        self.db = db_manager
+    def __init__(self, db_manager, personalization, searcher=None, agent_loop=None):
+        self.db            = db_manager
         self.personalization = personalization
-        self.searcher = searcher  # optional: used for context-enhanced greetings
+        self.searcher      = searcher
+        self._agent_loop   = agent_loop   # injected after construction if available
 
-    # ──────────────────────────────────────────────────────────────
-    # Public dispatch
-    # ──────────────────────────────────────────────────────────────
+    def set_agent_loop(self, agent_loop):
+        """Allow late injection of the agent loop for LLM access."""
+        self._agent_loop = agent_loop
 
-    async def handle(self, query: str, category, session_id: str) -> str:
-        """Route to the correct simple handler based on category."""
+    # ──────────────────────────────────────────────────────────────────────
+    # Public dispatch — now accepts optional ContextBundle
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def handle(
+        self,
+        query: str,
+        category,
+        session_id: str,
+        bundle: Optional["ContextBundle"] = None,
+    ) -> str:
+        """
+        Route to the correct simple handler based on category.
+        All handlers now receive the context bundle.
+        """
         from friday.router.intent_classifier import QueryCategory
         dispatch = {
             QueryCategory.GREETING:       self._handle_greeting,
@@ -44,51 +89,45 @@ class SimpleHandler:
         }
         handler = dispatch.get(category)
         if handler:
-            return await handler(query, session_id)
-        # Unknown simple category — surface gracefully
-        return await self._handle_fact_recall(query, session_id)
+            return await handler(query, session_id, bundle)
+        # Unknown simple category — fall back to fact recall
+        return await self._handle_fact_recall(query, session_id, bundle)
 
-    # ──────────────────────────────────────────────────────────────
-    # GENERAL CHAT — instant acknowledgement, no DB, no LLM
-    # ──────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────
+    # GREETING — LLM call with full profile context
+    # ──────────────────────────────────────────────────────────────────────
 
-    async def _handle_general_chat(self, query: str, session_id: str) -> str:
-        """Short casual inputs — direct JARVIS-style acknowledgement, zero latency."""
-        q = query.lower().strip()
-        # Cancellation / clearing intent
-        if any(w in q for w in ["cancel", "forget it", "never mind", "clear", "drop", "skip"]):
-            return "Understood, Sir. Consider it done."
-        # Affirmation
-        if any(w in q for w in ["ok", "okay", "sure", "got it", "noted", "alright", "fine", "yes", "yep"]):
-            return "Noted, Sir."
-        # Gratitude
-        if any(w in q for w in ["thanks", "thank you", "cheers", "appreciate"]):
-            return "Always, Sir."
-        # Generic short input — stay concise
-        return "Understood. What would you like me to do?"
-
-    # ──────────────────────────────────────────────────────────────
-    # PROGRESS QUERY — handled via execution state manager
-    # (SmartRouter intercepts this before reaching here, but kept as fallback)
-    # ──────────────────────────────────────────────────────────────
-
-    async def _handle_progress_query(self, query: str, session_id: str) -> str:
-        return "I am ready and waiting for your next instruction, Sir."
-
-    # ──────────────────────────────────────────────────────────────
-    # GREETING — instant, no DB
-    # ──────────────────────────────────────────────────────────────
-
-    async def _handle_greeting(self, query: str, session_id: str) -> str:
+    async def _handle_greeting(
+        self, query: str, session_id: str,
+        bundle: Optional["ContextBundle"] = None,
+    ) -> str:
+        """
+        Personalized greeting using profile (name, preferences).
+        Falls back to template if no LLM available.
+        """
+        # Quick fallback: get name from profile for template
         name = "Sir"
         if self.personalization:
-            stored = self.personalization.get_preference("address_as")
-            # Only use the stored value if it looks like a real name/title
-            # Reject single words that are common response words, not names
-            _JUNK_VALUES = {"done", "ok", "yes", "no", "sure", "okay", "thanks",
-                            "correct", "right", "great", "good", "fine", "alright"}
-            if stored and stored.lower().strip() not in _JUNK_VALUES and len(stored.strip()) >= 2:
-                name = stored.strip().title()
+            stored_name = (
+                self.personalization.get_fact("name")
+                or self.personalization.get_preference("address_as")
+            )
+            _JUNK = {"done", "ok", "yes", "no", "sure", "okay", "thanks",
+                     "correct", "right", "great", "good", "fine", "alright"}
+            if stored_name and stored_name.lower().strip() not in _JUNK and len(stored_name.strip()) >= 2:
+                name = stored_name.strip().title()
+
+        # If we have an LLM + bundle, give a genuinely personalized greeting
+        if self._agent_loop and bundle:
+            try:
+                augmented = bundle.augment(query)
+                response = await self._llm_respond(augmented)
+                if response:
+                    return response
+            except Exception as e:
+                logger.warning(f"[SimpleHandler] Greeting LLM call failed: {e}")
+
+        # Fallback template
         greetings = [
             f"Good day, {name}. How may I assist you?",
             f"Hello, {name}. What can I do for you?",
@@ -96,12 +135,56 @@ class SimpleHandler:
         ]
         return greetings[hash(query.lower().strip()) % len(greetings)]
 
+    # ──────────────────────────────────────────────────────────────────────
+    # GENERAL CHAT — LLM call with full context (biggest upgrade)
+    # ──────────────────────────────────────────────────────────────────────
 
-    # ──────────────────────────────────────────────────────────────
-    # CALENDAR QUERY — direct query on facts table
-    # ──────────────────────────────────────────────────────────────
+    async def _handle_general_chat(
+        self, query: str, session_id: str,
+        bundle: Optional["ContextBundle"] = None,
+    ) -> str:
+        """
+        Casual inputs — previously returned hardcoded "Noted, Sir."
+        Now makes a lightweight LLM call with the full context bundle so
+        even a casual remark gets a memory-aware, personalized response.
+        """
+        # Ultra-fast path: unambiguous one-word acknowledgements
+        q = query.lower().strip()
+        _ONE_WORD_ACK = {"ok", "okay", "k", "noted", "got it", "alright", "fine"}
+        if q in _ONE_WORD_ACK:
+            # Even here, use the stored name
+            name = "Sir"
+            if self.personalization:
+                stored_name = self.personalization.get_fact("name") or self.personalization.get_preference("address_as")
+                if stored_name and len(stored_name.strip()) >= 2:
+                    name = stored_name.strip().title()
+            return f"Noted, {name}."
 
-    async def _handle_calendar_query(self, query: str, session_id: str) -> str:
+        # For anything longer/richer → LLM with full bundle
+        if self._agent_loop and bundle:
+            try:
+                augmented = bundle.augment(query)
+                response = await self._llm_respond(augmented)
+                if response:
+                    return response
+            except Exception as e:
+                logger.warning(f"[SimpleHandler] General chat LLM call failed: {e}")
+
+        # Graceful fallback
+        if any(w in q for w in ["cancel", "forget it", "never mind"]):
+            return "Understood, Sir. Consider it done."
+        if any(w in q for w in ["thanks", "thank you", "cheers", "appreciate"]):
+            return "Always, Sir."
+        return "Understood. What would you like me to do?"
+
+    # ──────────────────────────────────────────────────────────────────────
+    # CALENDAR QUERY — direct SQLite, enriched with bundle conflict warning
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _handle_calendar_query(
+        self, query: str, session_id: str,
+        bundle: Optional["ContextBundle"] = None,
+    ) -> str:
         time_range = self._extract_time_range(query)
         try:
             conn = self.db.get_connection()
@@ -121,31 +204,40 @@ class SimpleHandler:
             return "I could not retrieve your calendar events right now."
 
         if not rows:
-            return f"You have no events scheduled {time_range['description']}."
+            base = f"You have no events scheduled {time_range['description']}."
+        else:
+            lines = [f"You have {len(rows)} event(s) {time_range['description']}:\n"]
+            for row in rows:
+                try:
+                    ds = datetime.datetime.fromisoformat(row["date_start"])
+                    date_str = ds.strftime("%A, %B %d at %I:%M %p")
+                    lines.append(f"  • {date_str}: {row['content']}")
+                except Exception:
+                    lines.append(f"  • {row['content']}")
+            base = "\n".join(lines)
 
-        lines = [f"You have {len(rows)} event(s) {time_range['description']}:\n"]
-        for row in rows:
-            try:
-                ds = datetime.datetime.fromisoformat(row["date_start"])
-                date_str = ds.strftime("%A, %B %d at %I:%M %p")
-                lines.append(f"  • {date_str}: {row['content']}")
-            except Exception:
-                lines.append(f"  • {row['content']}")
-        return "\n".join(lines)
+        # Append conflict warning from bundle if present
+        if bundle and bundle.conflict_warning:
+            base += "\n\n" + bundle.conflict_warning
 
-    # ──────────────────────────────────────────────────────────────
-    # FACT RECALL — direct query on user_profile table
-    # ──────────────────────────────────────────────────────────────
+        return base
 
-    async def _handle_fact_recall(self, query: str, session_id: str) -> str:
+    # ──────────────────────────────────────────────────────────────────────
+    # FACT RECALL — direct SQLite, context-enriched
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _handle_fact_recall(
+        self, query: str, session_id: str,
+        bundle: Optional["ContextBundle"] = None,
+    ) -> str:
         if not self.personalization:
             return "I have no profile data stored yet."
 
         # Try to match a specific key
         fact_key = self._extract_fact_key(query)
         if fact_key:
-            val = self.personalization.get_fact(fact_key) or \
-                  self.personalization.get_preference(fact_key)
+            val = (self.personalization.get_fact(fact_key)
+                   or self.personalization.get_preference(fact_key))
             if val:
                 return f"Your {fact_key.replace('_', ' ')} is: {val}."
 
@@ -153,13 +245,27 @@ class SimpleHandler:
         ctx = self.personalization.get_context_string()
         if ctx:
             return ctx
+
+        # If we have memory search results in bundle, surface those
+        if bundle and bundle.memory_ctx:
+            return f"Here is what I recall, Sir:\n{bundle.memory_ctx}"
+
         return "I do not have that information stored yet, Sir."
 
-    # ──────────────────────────────────────────────────────────────
-    # TEMPORAL FACT — query facts for a specific named event
-    # ──────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────
+    # TEMPORAL FACT — query facts for upcoming events
+    # ──────────────────────────────────────────────────────────────────────
 
-    async def _handle_temporal_fact(self, query: str, session_id: str) -> str:
+    async def _handle_temporal_fact(
+        self, query: str, session_id: str,
+        bundle: Optional["ContextBundle"] = None,
+    ) -> str:
+        # Use bundle itinerary if already assembled — avoids second DB hit
+        if bundle and bundle.itinerary_ctx:
+            return bundle.itinerary_ctx.replace(
+                "[ABSOLUTE CONTINUOUS ITINERARY — ALL UPCOMING EVENTS]\n", ""
+            ).strip()
+
         now = datetime.datetime.now()
         try:
             conn = self.db.get_connection()
@@ -186,22 +292,46 @@ class SimpleHandler:
             try:
                 ds = datetime.datetime.fromisoformat(row["date_start"])
                 days_until = (ds.date() - now.date()).days
-                if days_until == 0:
-                    label = "TODAY"
-                elif days_until == 1:
-                    label = "TOMORROW"
-                elif days_until < 0:
-                    label = f"{abs(days_until)} days ago"
-                else:
-                    label = f"in {days_until} days"
+                label = (
+                    "TODAY" if days_until == 0
+                    else "TOMORROW" if days_until == 1
+                    else f"{abs(days_until)} days ago" if days_until < 0
+                    else f"in {days_until} days"
+                )
                 lines.append(f"  • {row['content']} — {label}")
             except Exception:
                 lines.append(f"  • {row['content']}")
         return "\n".join(lines)
 
-    # ──────────────────────────────────────────────────────────────
-    # Helpers
-    # ──────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────
+    # PROGRESS QUERY — fallback (SmartRouter intercepts this first)
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _handle_progress_query(
+        self, query: str, session_id: str,
+        bundle: Optional["ContextBundle"] = None,
+    ) -> str:
+        return "I am ready and waiting for your next instruction, Sir."
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Internal LLM helper
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _llm_respond(self, augmented_message: str) -> str:
+        """
+        Make a single LLM call with the system prompt + augmented message.
+        Uses the injected AgentLoop's _llm_call() so we share one model instance.
+        """
+        messages = [
+            {"role": "system", "content": _SIMPLE_SYSTEM},
+            {"role": "user",   "content": augmented_message},
+        ]
+        response = await self._agent_loop._llm_call(messages)
+        return response.strip() if response else ""
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Helpers (unchanged from original)
+    # ──────────────────────────────────────────────────────────────────────
 
     def _extract_time_range(self, query: str) -> Dict[str, Any]:
         """Parse natural-language time expressions from query."""

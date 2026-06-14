@@ -10,13 +10,15 @@ from friday.memory.db_manager import MemoryDatabaseManager
 from friday.search.embedding_manager import EmbeddingManager
 from friday.search.hybrid_search import HybridSearcher
 from friday.tools.tools_legacy import ToolSystem, reindex_existing_files
-from friday.agents.friday.agent import AgentLoop
+from friday.agents.friday.agent import AgentLoop, FeedbackDetector
 from friday.router.smart_router import build_smart_router
 from friday.agents.friday.session import SessionManager
 from friday.memory.layers.layer_6_profile import UserPersonalization
 from friday.memory.layers.dreaming import MemoryDreamer
 from friday.memory.layers.promotion import promote_top_memories, prune_stale_entries, get_promotion_stats
-from friday.memory.layers.layer_3_episodic import groom_facts
+from friday.memory.layers.layer_3_episodic import groom_facts, FactStore
+from friday.memory.pipeline import MemoryPipeline
+from friday.memory.context_assembler import ContextAssembler
 from friday.llm import build_provider
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
@@ -124,15 +126,39 @@ async def main():
     loop._searcher = searcher  # enables proactive memory cross-reference on every message
     print(f"[OK] Agent loop ready ({llm_provider.active_slot_name}) — proactive memory enabled")
 
-    # 11. Smart Router (3-Tier Routing: Simple → Medium → Complex Multi-Agent)
-    router = build_smart_router(
-        agent_loop=loop,
-        db_manager=db_manager,
-        personalization=personalization,
-        searcher=searcher,
-        llm_provider=llm_provider,
+    # 11. Memory Pipeline — learns from EVERY input in background
+    fact_store       = FactStore(db_manager)
+    memory_pipeline  = MemoryPipeline(
+        db_manager         = db_manager,
+        personalization    = personalization,
+        embedding_manager  = embedder if use_real_embeddings else None,
+        fact_store         = fact_store,
     )
-    print("[OK] Smart Router ready (Simple / Medium / Complex Multi-Agent)")
+    print("[OK] Memory pipeline ready — continuous parallel learning active")
+
+    # 12. Context Assembler — builds full context bundle for ALL route tiers
+    feedback_detector = FeedbackDetector(personalization)
+    context_assembler = ContextAssembler(
+        searcher          = searcher,
+        fact_store        = fact_store,
+        personalization   = personalization,
+        feedback_detector = feedback_detector,
+    )
+    print("[OK] Context assembler ready — universal memory retrieval for all routes")
+
+    # 13. Smart Router (3-Tier Routing: Simple → Medium → Complex Multi-Agent)
+    router = build_smart_router(
+        agent_loop        = loop,
+        db_manager        = db_manager,
+        personalization   = personalization,
+        searcher          = searcher,
+        llm_provider      = llm_provider,
+        memory_pipeline   = memory_pipeline,
+        context_assembler = context_assembler,
+    )
+    # Give SimpleHandler access to the AgentLoop for LLM-backed responses
+    router.simple.set_agent_loop(loop)
+    print("[OK] Smart Router ready (Simple / Medium / Complex — all context-aware)")
 
     # Start Background Worker
     from friday.background.scheduler import BackgroundScheduler
@@ -243,9 +269,11 @@ async def main():
 
             print("Processing...")
             try:
-                result = await router.route(user_input, SESSION_ID)
+                # route_and_learn() also indexes FRIDAY's reply into vector DB
+                # so "what did you say about X" is searchable in future
+                result = await router.route_and_learn(user_input, SESSION_ID)
                 print(f"\nFriday: {result['text']}\n")
-                # Debug tier info (remove or comment out when not needed)
+                # Uncomment for debug tier info:
                 # print(f"  [tier={result['complexity']} | {result['latency_ms']:.0f}ms]\n")
             except asyncio.TimeoutError:
                 print("\n[ERROR] Response timed out. Try a simpler question.\n")

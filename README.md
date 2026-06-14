@@ -15,7 +15,7 @@ Every user message is classified and routed to the right handler automatically:
 
 | Tier | Handler | When Used | Target Latency |
 |------|---------|-----------|----------------|
-| **Simple** | `SimpleHandler` | Greetings, facts, calendar lookups, no tools needed | < 200ms |
+| **Simple** | `SimpleHandler` | Greetings, facts, calendar lookups. Now fully context-aware via lightweight LLM for chat. | < 500ms |
 | **Medium** | `MediumHandler` (AgentLoop) | Requires 1-3 tools (web search, calculator, memory) | < 2s |
 | **Complex** | `MultiAgentPlanner` + ExecutionEngine | Multi-step research, parallel agent coordination | Background |
 
@@ -86,7 +86,7 @@ The full `execution/` layer is architected and coded:
 The full awareness layer is designed:
 - `ContextTracker`, `ExecutionMonitor`, `WorldModel`, `StatusReporter`
 
-**Status**: All files exist and have correct structure, but **context injection into every LLM call** (the `[FRIDAY AWARENESS]` block) is not yet wired end-to-end. The `AgentLoop` injects memory context but not execution/world awareness.
+**Status**: The semantic memory, calendar, reminders, and profile data are now **fully injected into every LLM call across all tiers** (Simple, Medium, Complex) via the `ContextAssembler`. The execution and world model features (like weather/time) are still being wired.
 
 ### Background Scheduler & Goal Tracker
 `scheduler.py` (APScheduler-based) and `goal_tracker.py` are implemented.
@@ -126,7 +126,6 @@ The full awareness layer is designed:
 5. **Single DB connection (no pooling)** — `db_manager.get_connection()` returns a single connection without a pool, which will be a bottleneck under any concurrent load (e.g., when the API or Telegram adapters are added).
 6. **Context compaction summary drift** — the `_summary_cache` is stored in the `meta` table but is never invalidated or versioned. If the model changes, old summaries in a different "style" will persist.
 7. **No authentication or rate limiting** — the FastAPI server stub has no auth layer yet. This needs to be addressed before any public interface is deployed.
-8. **Awareness system not injected** — the `[FRIDAY AWARENESS]` block (execution status, world time, user focus) is designed in the architecture but not yet piped into `AgentLoop._build_system_prompt()`.
 
 ---
 
@@ -244,7 +243,6 @@ friday_mark2/
 - [ ] Wire Telegram adapter
 - [ ] Wire FastAPI REST server with auth
 - [ ] Start background scheduler on boot
-- [ ] Inject awareness context block into every LLM call
 - [ ] LiveKit voice interface (STT + TTS)
 - [ ] Write test suite (pytest)
 - [ ] Google Calendar/Gmail integration

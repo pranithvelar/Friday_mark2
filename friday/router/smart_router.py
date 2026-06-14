@@ -3,15 +3,27 @@ Smart Router — Central Coordinator
 =====================================
 The single entry point for ALL user queries.
 
+NEW: Every call to route() now does two things simultaneously:
+  1. WRITE PATH  — asyncio.create_task(memory_pipeline.process()) fires instantly
+                   in the background.  Friday learns from EVERY word you say.
+  2. READ PATH   — ContextAssembler.build() runs and produces a ContextBundle
+                   containing semantic memory search results, your calendar
+                   itinerary, reminders, conflict warnings, and profile data.
+                   This bundle is passed to EVERY handler — Simple, Medium, Complex.
+
 Routing flow:
   User Query
     │
-    ▼
-  FastIntentClassifier  (Tier 1, <50ms, pure regex)
+    ├── [BACKGROUND] MemoryPipeline.process()  ← fires instantly, never waited on
     │
-    ├── SIMPLE ────► SimpleHandler   (direct DB, <200ms)
-    ├── MEDIUM ────► MediumHandler   (AgentLoop, max 3 tools, <2s)
-    └── COMPLEX ───► MultiAgentPlanner → ExecutionEngine (background)
+    ├── ContextAssembler.build()               ← semantic search + calendar + profile
+    │
+    ▼
+  FastIntentClassifier  (Tier 1, <50ms, regex + LLM)
+    │
+    ├── SIMPLE ────► SimpleHandler(bundle)    (LLM + full context, <500ms)
+    ├── MEDIUM ────► MediumHandler(bundle)    (AgentLoop, max 3 tools, <2s)
+    └── COMPLEX ───► MultiAgentPlanner(bundle) → ExecutionEngine (background)
 
 Special fast-paths (no classifier needed):
   - "what are you doing?" + active execution → instant status from ExecutionState
@@ -22,12 +34,6 @@ Adapter design (future WhatsApp / Telegram / Frontend):
   returns a standard RouterResponse dict. The caller (terminal_chat.py,
   a WhatsApp webhook handler, a FastAPI endpoint, etc.) formats the
   response for its own channel.
-
-  To add a new channel integration:
-    1. Create a new entry script (e.g. whatsapp_adapter.py).
-    2. Import SmartRouter, call await router.route(message, session_id).
-    3. Format router.response["text"] for WhatsApp.
-    No changes to SmartRouter are needed.
 """
 
 import asyncio
@@ -44,12 +50,14 @@ class SmartRouter:
 
     Parameters
     ----------
-    classifier  : FastIntentClassifier
-    simple      : SimpleHandler
-    medium      : MediumHandler
-    planner     : MultiAgentPlanner
-    state_manager : ExecutionStateManager
-    agent_loop  : AgentLoop  (fallback for uncovered cases)
+    classifier        : FastIntentClassifier / LLMRouter
+    simple            : SimpleHandler
+    medium            : MediumHandler
+    planner           : MultiAgentPlanner
+    state_manager     : ExecutionStateManager
+    agent_loop        : AgentLoop  (fallback for uncovered cases)
+    memory_pipeline   : MemoryPipeline  (fires on every input)
+    context_assembler : ContextAssembler (builds context bundle for every input)
     """
 
     def __init__(
@@ -60,13 +68,17 @@ class SmartRouter:
         planner,
         state_manager,
         agent_loop,
+        memory_pipeline=None,
+        context_assembler=None,
     ):
-        self.classifier    = classifier
-        self.simple        = simple
-        self.medium        = medium
-        self.planner       = planner
-        self.state_manager = state_manager
-        self.loop          = agent_loop
+        self.classifier        = classifier
+        self.simple            = simple
+        self.medium            = medium
+        self.planner           = planner
+        self.state_manager     = state_manager
+        self.loop              = agent_loop
+        self.memory_pipeline   = memory_pipeline
+        self.context_assembler = context_assembler
 
     # ──────────────────────────────────────────────────────────────────────
     # Main routing method (platform-agnostic)
@@ -75,6 +87,10 @@ class SmartRouter:
     async def route(self, query: str, session_id: str) -> Dict[str, Any]:
         """
         Route a user query to the correct handler.
+
+        ALWAYS fires the memory pipeline in background first.
+        ALWAYS builds a context bundle before dispatching.
+        Every handler receives the full bundle — no route is left context-blind.
 
         Returns
         -------
@@ -89,7 +105,26 @@ class SmartRouter:
         """
         start = time.monotonic()
 
-        # ── Fast-path 0: Progress query with active execution ──────────────
+        # ── 1. WRITE PATH: fire memory learning pipeline INSTANTLY ─────────────
+        # Non-blocking — user never waits for this.
+        # Learns from every word: embeds text, extracts facts, updates profile,
+        # triggers promotion scoring.
+        if self.memory_pipeline:
+            asyncio.create_task(
+                self.memory_pipeline.process(query, session_id, role="user")
+            )
+
+        # ── 2. READ PATH: build shared context bundle for ALL handlers ─────────
+        # Runs semantic search, itinerary, reminders, profile in parallel.
+        # Result is passed to whichever handler wins — no route runs blind.
+        bundle = None
+        if self.context_assembler:
+            try:
+                bundle = await self.context_assembler.build(query, session_id)
+            except Exception as e:
+                logger.warning(f"[Router] ContextAssembler failed: {e}")
+
+        # ── Fast-path 0: Progress query with active execution ──────────────────
         active_exec = self.state_manager.get_session_execution(session_id)
         if active_exec:
             from friday.router.intent_classifier import QueryCategory
@@ -102,37 +137,35 @@ class SmartRouter:
                     category="progress_query",
                     latency_ms=(time.monotonic() - start) * 1000,
                 )
-
             # User sent something while engine is running → treat as interrupt
-            if not category == QueryCategory.PROGRESS_QUERY:
-                active_exec.request_interrupt(query)
-                return self._build_response(
-                    text=(
-                        f"Understood, Sir. I will adjust the current execution accordingly. "
-                        f"Currently at {active_exec.progress_percent:.0f}% progress."
-                    ),
-                    complexity="simple",
-                    category="execution_interrupt",
-                    latency_ms=(time.monotonic() - start) * 1000,
-                )
+            active_exec.request_interrupt(query)
+            return self._build_response(
+                text=(
+                    f"Understood, Sir. I will adjust the current execution accordingly. "
+                    f"Currently at {active_exec.progress_percent:.0f}% progress."
+                ),
+                complexity="simple",
+                category="execution_interrupt",
+                latency_ms=(time.monotonic() - start) * 1000,
+            )
 
-        # ── Classify via LLM (with regex fallback) ─────────────────────────
+        # ── 3. Classify via LLM (with regex fallback) ──────────────────────────
         complexity, category = await self.classifier.classify(query, session_id)
         logger.info(
             f"[Router] query='{query[:60]}' "
             f"→ complexity={complexity.value} category={category.value}"
         )
 
-        # ── Route by complexity ────────────────────────────────────────────
+        # ── 4. Route by complexity — ALL handlers receive the context bundle ───
         try:
             if complexity.value == "simple":
-                return await self._route_simple(query, category, session_id, start)
+                return await self._route_simple(query, category, session_id, start, bundle)
 
             elif complexity.value == "medium":
-                return await self._route_medium(query, session_id, start)
+                return await self._route_medium(query, session_id, start, bundle)
 
             else:  # complex
-                return await self._route_complex(query, session_id, start)
+                return await self._route_complex(query, session_id, start, bundle)
 
         except asyncio.TimeoutError:
             logger.error(f"[Router] Timeout routing query: {query[:60]}")
@@ -152,11 +185,14 @@ class SmartRouter:
             )
 
     # ──────────────────────────────────────────────────────────────────────
-    # Tier handlers
+    # Tier handlers — all accept context bundle
     # ──────────────────────────────────────────────────────────────────────
 
-    async def _route_simple(self, query: str, category, session_id: str, start: float) -> Dict[str, Any]:
-        text = await self.simple.handle(query, category, session_id)
+    async def _route_simple(
+        self, query: str, category, session_id: str,
+        start: float, bundle=None
+    ) -> Dict[str, Any]:
+        text = await self.simple.handle(query, category, session_id, bundle)
         return self._build_response(
             text=text,
             complexity="simple",
@@ -164,8 +200,11 @@ class SmartRouter:
             latency_ms=(time.monotonic() - start) * 1000,
         )
 
-    async def _route_medium(self, query: str, session_id: str, start: float) -> Dict[str, Any]:
-        result = await self.medium.handle(query, session_id)
+    async def _route_medium(
+        self, query: str, session_id: str,
+        start: float, bundle=None
+    ) -> Dict[str, Any]:
+        result = await self.medium.handle(query, session_id, bundle)
         return self._build_response(
             text=result["text"],
             complexity="medium",
@@ -174,8 +213,11 @@ class SmartRouter:
             latency_ms=(time.monotonic() - start) * 1000,
         )
 
-    async def _route_complex(self, query: str, session_id: str, start: float) -> Dict[str, Any]:
-        result = await self.planner.execute(query, session_id)
+    async def _route_complex(
+        self, query: str, session_id: str,
+        start: float, bundle=None
+    ) -> Dict[str, Any]:
+        result = await self.planner.execute(query, session_id, bundle)
         return self._build_response(
             text=result["text"],
             complexity="complex",
@@ -188,6 +230,26 @@ class SmartRouter:
                 "mode":       result.get("mode", "multi_agent"),
             },
         )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Also fire learning pipeline on bot responses so FRIDAY's own words
+    # become searchable in future queries
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def route_and_learn(self, query: str, session_id: str) -> Dict[str, Any]:
+        """
+        Convenience wrapper: route the query AND index the bot's reply.
+        Call this instead of route() when you want FRIDAY's responses
+        to also be embedded into the vector DB.
+        """
+        result = await self.route(query, session_id)
+        if self.memory_pipeline and result.get("text"):
+            asyncio.create_task(
+                self.memory_pipeline.process(
+                    result["text"], session_id, role="assistant"
+                )
+            )
+        return result
 
     # ──────────────────────────────────────────────────────────────────────
     # Standard response builder
@@ -222,15 +284,25 @@ def build_smart_router(
     personalization,
     searcher,
     llm_provider=None,
+    memory_pipeline=None,
+    context_assembler=None,
 ) -> SmartRouter:
     """
     Convenience factory — assembles all components and returns a SmartRouter.
-    Now uses LLMRouter (with regex fallback) instead of hardcoded patterns.
+
+    Parameters
+    ----------
+    memory_pipeline   : MemoryPipeline   — created in chat.py, passed here
+    context_assembler : ContextAssembler — created in chat.py, passed here
 
     Example
     -------
-    router = build_smart_router(loop, db_manager, personalization, searcher)
-    result = await router.route(user_message, SESSION_ID)
+    router = build_smart_router(
+        loop, db_manager, personalization, searcher,
+        memory_pipeline=pipeline,
+        context_assembler=assembler,
+    )
+    result = await router.route_and_learn(user_message, SESSION_ID)
     print(result["text"])
     """
     from friday.router.intent_classifier import FastIntentClassifier
@@ -268,10 +340,12 @@ def build_smart_router(
     )
 
     return SmartRouter(
-        classifier    = llm_router,
-        simple        = SimpleHandler(db_manager, personalization, searcher),
-        medium        = MediumHandler(agent_loop),
-        planner       = planner,
-        state_manager = state_manager,
-        agent_loop    = agent_loop,
+        classifier        = llm_router,
+        simple            = SimpleHandler(db_manager, personalization, searcher),
+        medium            = MediumHandler(agent_loop),
+        planner           = planner,
+        state_manager     = state_manager,
+        agent_loop        = agent_loop,
+        memory_pipeline   = memory_pipeline,
+        context_assembler = context_assembler,
     )

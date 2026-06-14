@@ -33,9 +33,11 @@ class MediumHandler:
         """
         self.loop = agent_loop
 
-    async def handle(self, query: str, session_id: str) -> Dict[str, Any]:
+    async def handle(self, query: str, session_id: str, bundle=None) -> Dict[str, Any]:
         """
         Run the AgentLoop with max_steps=3 (= max 3 tool invocations).
+        If a pre-assembled ContextBundle is provided, the query is pre-augmented
+        with memory/profile context before being handed to AgentLoop.
 
         Returns
         -------
@@ -46,7 +48,14 @@ class MediumHandler:
         # Snapshot history length before to diff tool calls used
         history_before = len(self.loop._history)
 
-        response = await self.loop.run(query, max_steps=self.MAX_TOOLS)
+        # If SmartRouter already assembled a context bundle, use it to
+        # pre-augment the message — AgentLoop will still do its own _pre_search
+        # which will now also find conversation chunks we've been indexing.
+        message = query
+        if bundle is not None and not bundle.is_empty:
+            message = bundle.augment(query)
+
+        response = await self.loop.run(message, max_steps=self.MAX_TOOLS)
 
         # Detect which tools were actually called by inspecting new history entries
         tools_used = self._extract_tools_from_history(history_before)

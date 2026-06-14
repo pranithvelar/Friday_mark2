@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import hashlib
 import time
 import logging
@@ -195,3 +195,87 @@ class EmbeddingManager:
     async def embed_query(self, text: str) -> List[float]:
         # Do not cache individual quick queries.
         return await self._embed_single_with_retry(text)
+
+    async def embed_and_store(self, text: str, metadata: dict) -> str:
+        """
+        Embed `text` and persist it into all three search tables:
+          - chunks          (metadata + content — the source of truth)
+          - chunks_vec      (float vector for semantic KNN search)
+          - chunks_fts      (FTS5 tokenised index for keyword search)
+
+        Returns the chunk_id so callers can reference it later.
+        Called by MemoryPipeline._embed_and_index() on EVERY user message.
+        """
+        import uuid
+        import struct
+        import json as _json
+
+        text = text.strip()
+        if not text:
+            return ""
+
+        # ── 1. Get embedding (inherits all retry + SQLite cache logic) ────────
+        try:
+            vecs = await self.embed_batch([text])
+            vec = vecs[0] if vecs else []
+        except Exception as e:
+            logger.warning(f"[embed_and_store] embedding failed: {e}")
+            vec = []
+
+        # ── 2. Build chunk record ─────────────────────────────────────────────
+        chunk_id   = str(uuid.uuid4())
+        source     = metadata.get("source", "conversation")
+        session_id = metadata.get("session_id", "unknown")
+        path       = f"conversation/{session_id}"
+        content    = text[:1000]   # cap at 1 k chars — enough for retrieval
+
+        conn = self.db.get_connection()
+        try:
+            # 2a. chunks table — always written so keyword search works even
+            #     when the vector table is unavailable
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO chunks
+                    (id, path, source, chunkIndex, content)
+                VALUES (?, ?, ?, 0, ?)
+                """,
+                (chunk_id, path, source, content)
+            )
+
+            # 2b. chunks_fts — FTS5 keyword index
+            try:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO chunks_fts
+                        (id, path, source, content)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (chunk_id, path, source, content)
+                )
+            except Exception as fts_err:
+                logger.debug(f"[embed_and_store] FTS insert skipped: {fts_err}")
+
+            # 2c. chunks_vec — binary-packed float vector for KNN
+            if vec and self.db.vector_enabled:
+                try:
+                    vec_bytes = struct.pack(f"{len(vec)}f", *vec)
+                    conn.execute(
+                        "INSERT OR IGNORE INTO chunks_vec (id, embedding) VALUES (?, ?)",
+                        (chunk_id, vec_bytes)
+                    )
+                except Exception as vec_err:
+                    logger.debug(f"[embed_and_store] vector insert skipped: {vec_err}")
+
+            conn.commit()
+            logger.debug(
+                f"[embed_and_store] stored chunk {chunk_id[:8]}… "
+                f"source={source} len={len(content)}"
+            )
+        except Exception as db_err:
+            logger.warning(f"[embed_and_store] DB write failed: {db_err}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        return chunk_id

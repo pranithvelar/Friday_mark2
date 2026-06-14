@@ -82,15 +82,21 @@ class MultiAgentPlanner:
 
     # ── Main entry point ──────────────────────────────────────────────────
 
-    async def execute(self, query: str, session_id: str) -> Dict[str, Any]:
+    async def execute(self, query: str, session_id: str, bundle=None) -> Dict[str, Any]:
         """
         Build a plan then hand it to the ExecutionEngine.
         Returns immediately with execution_id — engine runs in background.
+
+        If a ContextBundle is provided by SmartRouter, it is used directly
+        instead of re-running _gather_memory_context() (avoids duplicate search).
         """
         self.loop._status("Planning multi-step task...")
 
-        # 1. Build memory context to inject into planning
-        memory_ctx = await self._gather_memory_context(query, session_id)
+        # 1. Use pre-built bundle from SmartRouter, or gather fresh if not provided
+        if bundle is not None and not bundle.is_empty:
+            memory_ctx = bundle.augmented_prefix
+        else:
+            memory_ctx = await self._gather_memory_context(query, session_id)
 
         # 2. Generate plan via LLM
         plan = await self._generate_plan(query, memory_ctx)
@@ -113,9 +119,7 @@ class MultiAgentPlanner:
         self.loop._status(f"Plan ready: {step_count} steps. Execution started.")
 
         return {
-            "text": (
-                f"Understood, Sir. On it."
-            ),
+            "text": "Understood, Sir. On it.",
             "tools_used": [s.tool_category for s in plan.steps],
             "execution_id": execution_id,
             "plan_steps": step_count,
