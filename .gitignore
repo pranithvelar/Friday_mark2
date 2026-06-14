@@ -1,0 +1,49 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Database & Memory (runtime data - don't commit)
+workspace/
+test_workspace/
+memory/
+*.db
+*.db-shm
+*.db-wal
+*.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+
+# Docker
+.dockerignore
+
+# Distribution
+dist/
+build/
+*.egg-info/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# UV lock file (poetry alternative)
+uv.lock
+
+# LLM API keys
+.env

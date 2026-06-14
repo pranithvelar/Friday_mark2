@@ -1,0 +1,30 @@
+[tool.poetry]
+name = "intelligent-memory"
+version = "0.1.0"
+description = "Intelligent Memory System ported from OpenClaw"
+authors = ["AI Assistant"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+sqlite-vec = "*"
+ollama = "*"
+watchdog = "*"
+apscheduler = "*"
+fastapi = "*"
+uvicorn = "*"
+pydantic = "*"
+pyyaml = "*"
+numpy = "*"
+typer = "*"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "*"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+pythonpath = [
+  "."
+]

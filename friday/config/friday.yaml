@@ -1,0 +1,4 @@
+﻿# Friday configuration
+model: llama3.1:8b
+db_path: workspace/memory.db
+log_level: INFO
