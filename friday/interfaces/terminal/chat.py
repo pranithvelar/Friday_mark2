@@ -7,10 +7,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 
 from friday.config.settings import IntelligentMemoryConfig
 from friday.memory.db_manager import MemoryDatabaseManager
-from friday.search.embedding_manager import EmbeddingManager
-from friday.search.hybrid_search import HybridSearcher
+from friday.search.indexer import TextIndexer
+from friday.search.fts_search import FTSSearcher
 from friday.tools.tools_legacy import ToolSystem, reindex_existing_files
-from friday.agents.friday.agent import AgentLoop, FeedbackDetector
+from friday.agents.friday.agent import AgentLoop
 from friday.router.smart_router import build_smart_router
 from friday.agents.friday.session import SessionManager
 from friday.memory.layers.layer_6_profile import UserPersonalization
@@ -19,7 +19,15 @@ from friday.memory.layers.promotion import promote_top_memories, prune_stale_ent
 from friday.memory.layers.layer_3_episodic import groom_facts, FactStore
 from friday.memory.pipeline import MemoryPipeline
 from friday.memory.context_assembler import ContextAssembler
+from friday.memory.project_chronicle import ProjectRegistry, ProjectClassifier, ProjectDreamer
+from friday.memory.project_chronicle.safety import (
+    ChronicleCircuitBreaker, SafeChronicle, check_health
+)
+from friday.awareness.live_context import LiveContextState, LiveContextLoop
 from friday.llm import build_provider
+from friday.memory.layers.layer_4_semantic import SemanticMemory
+from friday.memory.layers.layer_5_procedural import ProceduralMemory
+from friday.background.knowledge_extractor import KnowledgeExtractor
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -41,27 +49,13 @@ async def main():
     db_path = os.path.join(workspace, "memory.db")
     db_manager = MemoryDatabaseManager(db_path)
     db_manager.ensure_schema()
-    db_manager.ensure_vector_table(dimensions=768)
     print("[OK] Database initialized (all state in SQLite)")
-
-    # 2. Embeddings (real with fallback)
-    use_real_embeddings = True
-    try:
-        embedder = EmbeddingManager(db_manager, model=config.embedding_model, dimension=768)
-        test_vec = await embedder.embed_query("test")
-        if len(test_vec) != 768:
-            raise ValueError(f"Bad dimension: {len(test_vec)}")
-        print(f"[OK] Real embeddings active ({config.embedding_model})")
-    except Exception as e:
-        print(f"[WARN] Embeddings unavailable ({e}). Keyword-only search.")
-        use_real_embeddings = False
-        class FallbackEmbedder:
-            async def embed_query(self, text):
-                return [0.0] * 768
-        embedder = FallbackEmbedder()
+    
+    # 2. Text Indexer
+    indexer = TextIndexer(db_manager)
 
     # 3. Searcher
-    searcher = HybridSearcher(db_manager, embedder)
+    searcher = FTSSearcher(db_manager)
 
     # 4. Personalization (DB-backed)
     personalization = UserPersonalization(db_manager)
@@ -87,7 +81,7 @@ async def main():
         print(f"[OK] Pruned {pruned} stale recall entries")
         
     try:
-        await groom_facts(db_manager, embedder, workspace_dir=workspace)
+        await groom_facts(db_manager, None, workspace_dir=workspace)
         print("[OK] Groomed expired temporal facts")
     except Exception as e:
         print(f"[WARN] Failed to groom facts: {e}")
@@ -131,20 +125,256 @@ async def main():
     memory_pipeline  = MemoryPipeline(
         db_manager         = db_manager,
         personalization    = personalization,
-        embedding_manager  = embedder if use_real_embeddings else None,
+        indexer            = indexer,
         fact_store         = fact_store,
     )
     print("[OK] Memory pipeline ready — continuous parallel learning active")
 
-    # 12. Context Assembler — builds full context bundle for ALL route tiers
-    feedback_detector = FeedbackDetector(personalization)
+    # 11b. Project Chronicle — JARVIS-style per-project documentation
+    proj_registry   = ProjectRegistry(workspace)
+    proj_classifier = ProjectClassifier(None)
+    proj_dreamer    = ProjectDreamer(proj_registry, llm_provider=llm_provider)
+
+    # ── Safety Layer 1: Health check + repair at startup ────────────────────
+    import os as _os
+    health = check_health(_os.path.join(workspace, "memory", "projects"))
+    if health.issues_found:
+        print(f"[Chronicle] Health check: {health.issues_fixed or health.unfixable}")
+    if health.unfixable:
+        print(f"[Chronicle] WARNING: unfixable issues: {health.unfixable}")
+
+    # ── Safety Layer 2: Circuit breaker ────────────────────────────────
+    chronicle_breaker = ChronicleCircuitBreaker(trip_threshold=5, reset_seconds=600)
+
+    # Pre-embed all existing projects at startup so classifier is warm
+    await proj_classifier.load_all_projects(proj_registry)
+
+    # Mark projects dormant if idle > 7 days
+    dormant_slugs = proj_registry.check_and_mark_dormant()
+    if dormant_slugs:
+        print(f"[OK] Marked {len(dormant_slugs)} project(s) dormant: {dormant_slugs}")
+
+    # Bundle for pipeline + router injection
+    chronicle = {
+        "registry":   proj_registry,
+        "classifier": proj_classifier,
+        "dreamer":    proj_dreamer,
+    }
+    # ── Safety Layer 3: SafeChronicle shell ─────────────────────────────
+    # Wraps every operation: atomic writes, per-project lock, circuit breaker.
+    # Injected into chronicle dict as 'safe' for router + pipeline.
+    safe_chronicle = SafeChronicle(chronicle, chronicle_breaker)
+    chronicle["safe"]    = safe_chronicle
+    chronicle["breaker"] = chronicle_breaker
+
+    # Inject chronicle into the memory pipeline so it can create project folders
+    memory_pipeline.chronicle = chronicle
+    n_projects = len(proj_registry.list_projects())
+    print(f"[OK] Project Chronicle ready — {n_projects} project(s) tracked | safety system active")
+
+    # 12. Layer 4 — Semantic Memory (inferred stable facts)
+    semantic_memory = SemanticMemory(db_manager)
+    sf_count = len(semantic_memory.get_all_active())
+    print(f"[OK] Layer 4 (Semantic Memory) ready — {sf_count} fact(s)")
+
+    # 13. Layer 5 — Procedural Memory (behavioral patterns via LearningEngine)
+    from friday.execution.learning import LearningEngine
+    learning_engine = LearningEngine(db_manager)
+    procedural_memory = ProceduralMemory(learning_engine)
+    print("[OK] Layer 5 (Procedural Memory) ready")
+
+    # 14. Knowledge Extractor (background L4+L5 updater)
+    knowledge_extractor = KnowledgeExtractor(
+        llm_provider      = llm_provider,
+        semantic_memory   = semantic_memory,
+        procedural_memory = procedural_memory,
+        profile           = personalization,   # L6 cross-check: won't re-add what Reflection already stored
+    )
+    loop._knowledge_extractor = knowledge_extractor
+    print("[OK] KnowledgeExtractor ready — deep learning active (every 20 messages)")
+
+    # 15. Context Assembler — builds full context bundle for ALL route tiers
     context_assembler = ContextAssembler(
         searcher          = searcher,
         fact_store        = fact_store,
         personalization   = personalization,
-        feedback_detector = feedback_detector,
+        semantic_memory   = semantic_memory,
+        procedural_memory = procedural_memory,
     )
-    print("[OK] Context assembler ready — universal memory retrieval for all routes")
+    print("[OK] Context assembler ready — L2/L3/L4/L5/L6 all wired")
+
+    # 16. Register BRAIN tools for L4 + L5 + personalization
+    #     The LLM sees these in SYSTEM_PROMPT KNOWLEDGE PROTOCOL and calls them silently.
+
+    def _remember_fact(subject: str, predicate: str, object: str, confidence: float = 0.7) -> str:
+        fact_id = semantic_memory.add_fact(subject, predicate, object, confidence=confidence, source="stated")
+        return f"Stored: {subject} {predicate} {object}"
+
+    loop.register_tool("remember_fact", _remember_fact, {
+        "name": "remember_fact",
+        "description": "Store a stable fact about the user into Layer 4 (semantic memory)",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "subject":    {"type": "string", "description": "Who — usually the user's name or 'the user'"},
+                "predicate":  {"type": "string", "description": "Relationship — e.g. 'is studying', 'works at'"},
+                "object":     {"type": "string", "description": "The value — e.g. 'Computer Science'"},
+                "confidence": {"type": "number", "description": "Confidence 0.0-1.0 (default 0.7)"},
+            },
+            "required": ["subject", "predicate", "object"]
+        }
+    })
+
+    def _update_fact(fact_id: str, new_value: str, confidence: float = 0.85) -> str:
+        ok = semantic_memory.update_fact(fact_id, new_object=new_value, new_confidence=confidence)
+        return "Updated" if ok else f"Fact {fact_id[:8]} not found"
+
+    loop.register_tool("update_fact", _update_fact, {
+        "name": "update_fact",
+        "description": "Correct an existing Layer 4 semantic fact. Use when user corrects something FRIDAY believes.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fact_id":    {"type": "string", "description": "Full UUID of the fact to update"},
+                "new_value":  {"type": "string", "description": "The corrected object value"},
+                "confidence": {"type": "number"},
+            },
+            "required": ["fact_id", "new_value"]
+        }
+    })
+
+    def _forget_fact(fact_id: str) -> str:
+        ok = semantic_memory.delete_fact(fact_id)
+        return "Deleted" if ok else f"Fact {fact_id[:8]} not found"
+
+    loop.register_tool("forget_fact", _forget_fact, {
+        "name": "forget_fact",
+        "description": "Soft-delete a Layer 4 semantic fact. Use when user says something is no longer true.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fact_id": {"type": "string", "description": "Full UUID of the fact to delete"},
+            },
+            "required": ["fact_id"]
+        }
+    })
+
+    async def _remember_pattern(trigger: str, behavior: str, context: str = "general") -> str:
+        await procedural_memory.add_pattern(trigger, behavior, context=context)
+        return f"Pattern saved: '{trigger}' → '{behavior}'"
+
+    loop.register_tool("remember_pattern", _remember_pattern, {
+        "name": "remember_pattern",
+        "description": "Save a behavioral pattern about how the user prefers to work (Layer 5)",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "trigger":  {"type": "string", "description": "When this happens — e.g. 'asks for a summary'"},
+                "behavior": {"type": "string", "description": "Do this — e.g. 'bullet points, max 5'"},
+                "context":  {"type": "string", "description": "Optional context tag (default: general)"},
+            },
+            "required": ["trigger", "behavior"]
+        }
+    })
+
+    async def _update_pattern(trigger: str, old_behavior: str, new_behavior: str, context: str = "general") -> str:
+        await procedural_memory.correct_pattern(trigger, old_behavior, new_behavior, context=context)
+        return f"Pattern corrected: '{trigger}'"
+
+    loop.register_tool("update_pattern", _update_pattern, {
+        "name": "update_pattern",
+        "description": "Correct a behavioral pattern when the user explicitly changes a preference (Layer 5)",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "trigger":      {"type": "string"},
+                "old_behavior": {"type": "string"},
+                "new_behavior": {"type": "string"},
+                "context":      {"type": "string"},
+            },
+            "required": ["trigger", "old_behavior", "new_behavior"]
+        }
+    })
+
+    async def _delete_pattern(trigger: str, context: str = "general") -> str:
+        ok = await procedural_memory.delete_pattern(trigger, context=context)
+        return "Deleted" if ok else f"Pattern '{trigger}' not found"
+
+    loop.register_tool("delete_pattern", _delete_pattern, {
+        "name": "delete_pattern",
+        "description": "Remove a behavioral pattern completely (Layer 5)",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "trigger": {"type": "string"},
+                "context": {"type": "string"},
+            },
+            "required": ["trigger"]
+        }
+    })
+
+    def _store_personalization(key: str, value: str) -> str:
+        """General personalization tool — LLM decides what to store."""
+        if any(k in key.lower() for k in ["name", "call", "address"]):
+            personalization.update_preference("address_as", value)
+        elif any(k in key.lower() for k in ["style", "length", "format"]):
+            personalization.update_preference("response_style", value)
+        elif any(k in key.lower() for k in ["tone"]):
+            personalization.update_preference("tone", value)
+        else:
+            personalization.update_fact(key, value)
+        return f"Personalization saved: {key}={value}"
+
+    loop.register_tool("store_personalization", _store_personalization, {
+        "name": "store_personalization",
+        "description": "Store any user preference or personal detail into Layer 6 (profile)",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "key":   {"type": "string", "description": "Category — e.g. 'name', 'response_style', 'tone'"},
+                "value": {"type": "string", "description": "The value to store"},
+            },
+            "required": ["key", "value"]
+        }
+    })
+
+    def _list_facts(query: str = "") -> str:
+        results = semantic_memory.search_facts(query) if query else semantic_memory.get_all_active(limit=20)
+        if not results:
+            return "No semantic facts stored yet."
+        lines = [f"[{f['id'][:8]}] {f['subject']} {f['predicate']} {f['object']} (conf={f['confidence']:.2f})" for f in results]
+        return "\n".join(lines)
+
+    loop.register_tool("list_facts", _list_facts, {
+        "name": "list_facts",
+        "description": "Show all stored semantic facts about the user (Layer 4). Use when user asks what you know.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Optional keyword to filter facts"},
+            },
+        }
+    })
+
+    async def _list_patterns(query: str = "") -> str:
+        patterns = await procedural_memory.get_all_patterns(min_confidence=0.3)
+        if not patterns:
+            return "No behavioral patterns stored yet."
+        lines = [f"[{p.pattern_id[:8]}] trigger='{p.key}' → '{p.value}' (conf={p.confidence:.2f})" for p in patterns]
+        return "\n".join(lines)
+
+    loop.register_tool("list_patterns", _list_patterns, {
+        "name": "list_patterns",
+        "description": "Show all behavioral patterns about the user (Layer 5). Use when user asks how you adapt.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Optional keyword to filter patterns"},
+            },
+        }
+    })
+
+    print(f"[OK] 9 BRAIN tools registered (L4 facts + L5 patterns + personalization)")
 
     # 13. Smart Router (3-Tier Routing: Simple → Medium → Complex Multi-Agent)
     router = build_smart_router(
@@ -158,7 +388,52 @@ async def main():
     )
     # Give SimpleHandler access to the AgentLoop for LLM-backed responses
     router.simple.set_agent_loop(loop)
+    # Inject project chronicle into router for per-message classification + logging
+    router.set_chronicle(chronicle)
+    # Inject EventEngine — instant hot-path event detection + conflict check
+    # Zero LLM, zero API, pure regex + SQLite (~10ms). Runs before every LLM call.
+    from friday.memory.event_engine import EventEngine
+    event_engine = EventEngine(fact_store)
+    router.set_event_engine(event_engine)
     print("[OK] Smart Router ready (Simple / Medium / Complex — all context-aware)")
+    print("[OK] EventEngine ready (hot-path event detection, zero LLM, ~10ms)")
+
+
+    # Schedule ProjectDreamer to run every 30 minutes in background
+    async def _project_dream_loop():
+        while True:
+            await asyncio.sleep(30 * 60)  # 30 minutes
+            try:
+                synthesized = await proj_dreamer.run_cycle()
+                if synthesized:
+                    logger.info(f"[ProjectDreamer] Cycle complete: {synthesized}")
+            except Exception as e:
+                logger.warning(f"[ProjectDreamer] Cycle error: {e}")
+    asyncio.create_task(_project_dream_loop())
+
+    # ── LIVE CONTEXT LOOP ───────────────────────────────────────────────
+    # Background loop that continuously refreshes the MAIN BRAIN's awareness.
+    # Runs every 8 seconds, independently of user input.
+    # The brain reads this on EVERY LLM call via AgentLoop._build_system_prompt().
+    from friday.execution.state_manager import ExecutionStateManager
+    live_ctx = LiveContextState()
+    # Get the state_manager from the router's planner
+    _state_mgr = getattr(getattr(router, 'planner', None), 'execution_engine', None)
+    _state_mgr = getattr(_state_mgr, 'state_manager', None)
+    live_loop = LiveContextLoop(
+        live_ctx      = live_ctx,
+        fact_store    = fact_store,
+        state_manager = _state_mgr,
+        interval      = 8,
+    )
+    # Inject live_ctx into AgentLoop so _build_system_prompt reads it always
+    loop._live_ctx = live_ctx
+    # Inject live_ctx into router so plan approval gate can write pending_plan_block
+    router.set_live_ctx(live_ctx)
+    # Start background refresh
+    asyncio.create_task(live_loop.run())
+    print("[OK] Live context loop started — brain always aware (8s refresh)")
+
 
     # Start Background Worker
     from friday.background.scheduler import BackgroundScheduler
@@ -258,7 +533,7 @@ async def main():
                     print(f"\n  Database chunks: {chunks}")
                     print(f"  Active facts: {fact_count}")
                     print(f"  Session messages: {sessions}")
-                    print(f"  Embeddings: {'Real' if use_real_embeddings else 'Fallback'}")
+                    print(f"  Search: FTS5 (Pure Keyword)")
                     print(f"  Context window: last 10 + summary")
                     print(f"  --- Promotion ---")
                     print(f"  Tracked: {ps['total_tracked']}, Promoted: {ps['promoted']}, Pending: {ps['pending']}")

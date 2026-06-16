@@ -29,6 +29,7 @@ class QueryCategory(Enum):
     TEMPORAL_FACT   = "temporal_fact"    # "When is my flight?"
     PROGRESS_QUERY  = "progress_query"   # "What are you doing?" / "What's the status?"
     GENERAL_CHAT    = "general_chat"     # Short casual chat: "ok", "cancel plans", "thanks", "got it"
+    CLARIFY         = "clarify"          # Request is complex but vague — ask for more detail
 
     # ── MEDIUM ──────────────────────────────────────────────
     SINGLE_SEARCH   = "single_search"    # "Search for X"

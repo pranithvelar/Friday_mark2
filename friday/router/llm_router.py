@@ -42,25 +42,41 @@ ROUTER_NUM_CTX     = 256   # Tiny context — just the query + system prompt
 # ── The classification prompt ─────────────────────────────────────────────────
 # This is intentionally minimal. We want ONE word out, nothing else.
 _ROUTER_SYSTEM = """\
-You are a routing classifier for an AI assistant called Friday.
-Classify the user's message into exactly ONE of these three tiers:
+You are the routing brain of Friday, a personal AI assistant.
 
-simple  - Greetings, status checks, exact date/schedule lookups, or short casual conversation
-          (e.g. "hi", "hello", "what time is my meeting?", "what's my schedule?",
-           "what is my email?", "cancel my plans", "ok cool", "thanks")
+Classify the user's message into EXACTLY ONE of these four outcomes:
 
-medium  - General knowledge questions, advice, conversational topics, single tool actions, or anything needing a natural language response
-          (e.g. "what do you know about me?", "remind me to buy milk", "who are you?",
-           "what should I learn first?", "explain transformers", "what's the difference between ML and AI?")
+simple  - No tool call needed. Covers EVERYTHING conversational including:
+          • Greetings, acks, casual chat ("hey", "ok", "cool", "thanks")
+          • Calendar/event lookups ("what's my schedule?", "do I have anything today?")
+          • Adding, cancelling, or modifying a reminder/event ("remind me at 3pm", "cancel my trip")
+          • Profile/memory queries ("what's my email?", "what do you know about me?")
+          • Any single-intent conversational request
 
-complex - Explicit multi-step planning, in-depth research with synthesis, code generation, or comparative analysis
-          (e.g. "research AI trends and write a report", "plan my entire week",
-           "build a Python script that does X", "compare these two options in depth")
+medium  - Needs 1–3 TOOLS (not steps) to complete:
+          • A web search, file action, or data retrieval needing 1-3 distinct tool calls
+          • Tasks that are self-contained within 3 tool calls
 
-Output ONLY the single word: simple, medium, or complex.
-No explanation. No punctuation. Just the word."""
+complex - ONLY for explicit multi-step PROJECTS with a clear ACTION command:
+          • "research X and write a full report"
+          • "build me a tracker app" / "implement X" / "start building Y"
+          • "plan my entire week with tasks"
+          • The user must have EXPLICITLY said to build/do/implement/start/create it.
+          DO NOT use complex if the user is only describing or explaining an idea.
 
-_VALID_TIERS = {"simple", "medium", "complex"}
+clarify - Use when the request is too vague OR when the user is describing/pitching
+          an idea rather than issuing an explicit command:
+          • "build something", "do some research", "make an app" — no specifics given
+          • "I have an idea about an app", "so I was thinking of building X",
+            "it basically works like this..." — user is EXPLAINING, not commanding.
+          • Any message where the user is pitching a concept but has NOT yet said
+            "build it", "do it", "implement it", "start", or "go ahead".
+          When in doubt between complex and clarify → always choose clarify.
+
+Output ONLY one word: simple  medium  complex  clarify
+No punctuation. No explanation."""
+
+_VALID_TIERS = {"simple", "medium", "complex", "clarify"}
 
 
 class LLMRouter:
@@ -76,9 +92,7 @@ class LLMRouter:
         self.model     = model
         self.fallback  = fallback_classifier
         self._llm_provider = llm_provider
-        # Per-session cache: {session_id: {query_lower: (complexity, category)}}
-        self._cache: Dict[str, Dict[str, Tuple[QueryComplexity, QueryCategory]]] = {}
-        self._stats = {"llm_hits": 0, "fallback_hits": 0, "cache_hits": 0}
+        self._stats = {"llm_hits": 0, "fallback_hits": 0}
 
     async def classify(
         self,
@@ -88,17 +102,15 @@ class LLMRouter:
         """
         Classify a query using the LLM with regex fallback.
 
+        Cache intentionally removed: conversational context changes the meaning
+        of the same phrase ("remind me tomorrow" means different things on
+        different days). Every query is classified fresh — the 2s timeout +
+        regex fallback already guarantees sub-200ms worst-case latency.
+
         Returns (QueryComplexity, QueryCategory) — same as FastIntentClassifier.
         Never raises. Guaranteed to return a result.
         """
         query_stripped = query.strip()
-        cache_key = query_stripped.lower()
-
-        # ── Cache hit ─────────────────────────────────────────────────────────
-        session_cache = self._cache.setdefault(session_id, {})
-        if cache_key in session_cache:
-            self._stats["cache_hits"] += 1
-            return session_cache[cache_key]
 
         # ── Try LLM classification ────────────────────────────────────────────
         tier = await self._call_llm(query_stripped)
@@ -108,8 +120,7 @@ class LLMRouter:
             result = self._tier_to_enums(tier, query_stripped)
             logger.debug(
                 f"[LLMRouter] '{query_stripped[:50]}' → {tier} (LLM) "
-                f"| cache={self._stats['cache_hits']} llm={self._stats['llm_hits']} "
-                f"fallback={self._stats['fallback_hits']}"
+                f"| llm={self._stats['llm_hits']} fallback={self._stats['fallback_hits']}"
             )
         else:
             # ── Regex fallback ────────────────────────────────────────────────
@@ -119,9 +130,8 @@ class LLMRouter:
                 f"[LLMRouter] '{query_stripped[:50]}' → {result[0].value} (REGEX FALLBACK)"
             )
 
-        # Cache and return
-        session_cache[cache_key] = result
         return result
+
 
     # ── LLM call ──────────────────────────────────────────────────────────────
 
@@ -201,51 +211,20 @@ class LLMRouter:
         query: str,
     ) -> Tuple[QueryComplexity, QueryCategory]:
         """
-        Map a tier string to (QueryComplexity, QueryCategory).
-        Category is set to a sensible default — the specific handler
-        in SimpleHandler/MediumHandler/Planner does the real work.
+        Pure 1:1 pass-through from LLM tier word to enums.
+        Zero keywords. Zero regex. The LLM made the decision — we trust it.
         """
+        from friday.router.intent_classifier import QueryComplexity, QueryCategory
         if tier == "simple":
-            q = query.lower().strip()
-            # Greetings
-            if re.match(r"^(?:hi+|hello|hey+|good\s+(?:morning|evening|afternoon|night)|howdy|sup|yo)", q):
-                return (QueryComplexity.SIMPLE, QueryCategory.GREETING)
-            # Progress / status checks
-            if re.search(r"\b(?:what(?:'re| are) you doing|status|progress)\b", q):
-                return (QueryComplexity.SIMPLE, QueryCategory.PROGRESS_QUERY)
-            # Calendar / schedule / plans lookups
-            if re.search(
-                r"\b(?:event|events|meeting|meetings|appointment|schedule|calendar"
-                r"|plan|plans|today|tomorrow|tmrw|tmr|this week|next week|this weekend"
-                r"|monday|tuesday|wednesday|thursday|friday|saturday|sunday"
-                r"|morning|evening|tonight|upcoming|agenda)\b",
-                q
-            ):
-                return (QueryComplexity.SIMPLE, QueryCategory.CALENDAR_QUERY)
-            # Strict single-field fact lookups only
-            if re.match(
-                r"^(?:what(?:'?s| is) my|tell me my|show me my) "
-                r"(?:phone(?: number)?|email(?: address)?|address|birthday|age|name)\??$",
-                q, re.IGNORECASE
-            ):
-                return (QueryComplexity.SIMPLE, QueryCategory.FACT_RECALL)
-            # Everything else the LLM called 'simple' is short casual conversation.
-            # Return GENERAL_CHAT so SimpleHandler gives a direct ack without any LLM call.
             return (QueryComplexity.SIMPLE, QueryCategory.GENERAL_CHAT)
-
         if tier == "medium":
             return (QueryComplexity.MEDIUM, QueryCategory.SINGLE_SEARCH)
-
-        # complex
+        if tier == "clarify":
+            return (QueryComplexity.SIMPLE, QueryCategory.CLARIFY)
+        # complex (default)
         return (QueryComplexity.COMPLEX, QueryCategory.MULTI_STEP_RESEARCH)
 
     # ── Diagnostics ───────────────────────────────────────────────────────────
 
     def get_stats(self) -> Dict[str, int]:
         return dict(self._stats)
-
-    def clear_cache(self, session_id: Optional[str] = None):
-        if session_id:
-            self._cache.pop(session_id, None)
-        else:
-            self._cache.clear()

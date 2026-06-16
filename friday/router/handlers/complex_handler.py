@@ -84,42 +84,88 @@ class MultiAgentPlanner:
 
     async def execute(self, query: str, session_id: str, bundle=None) -> Dict[str, Any]:
         """
-        Build a plan then hand it to the ExecutionEngine.
-        Returns immediately with execution_id — engine runs in background.
+        PHASE 1 of execution: generate plan and return it for user approval.
+        FRIDAY presents the plan and waits. Execution is NOT triggered here.
 
-        If a ContextBundle is provided by SmartRouter, it is used directly
-        instead of re-running _gather_memory_context() (avoids duplicate search).
+        After user approves (SmartRouter detects 'yes/proceed'),
+        SmartRouter calls fire_plan() with the stored plan.
+
+        Returns dict with mode='awaiting_approval' and the human-readable plan.
         """
-        self.loop._status("Planning multi-step task...")
+        self.loop._status("Thinking through your request...")
 
-        # 1. Use pre-built bundle from SmartRouter, or gather fresh if not provided
+        # Use pre-built bundle from SmartRouter, or gather fresh if not provided
         if bundle is not None and not bundle.is_empty:
             memory_ctx = bundle.augmented_prefix
         else:
             memory_ctx = await self._gather_memory_context(query, session_id)
 
-        # 2. Generate plan via LLM
+        # Generate plan via LLM
         plan = await self._generate_plan(query, memory_ctx)
         if not plan:
-            # Fallback: let AgentLoop handle it directly
-            logger.info("[Planner] Plan generation failed; falling back to AgentLoop")
-            response = await self.loop.run(query, max_steps=5)
+            # Plan generation failed (e.g. LLM rate-limit, timeout, or bad parse).
+            # Do NOT fall back to raw AgentLoop — it will loop on tool calls and hit max_steps.
+            # Instead, respond conversationally so the user can rephrase or retry.
+            logger.warning("[Planner] Plan generation failed — responding gracefully")
+            # Try a simple one-shot LLM response with no tools as a best-effort answer
+            try:
+                graceful = await self.loop._llm_call([
+                    {"role": "system", "content": (
+                        "You are Friday, a concise personal AI assistant. "
+                        "Acknowledge the user's idea or request in 1-2 sentences, "
+                        "then ask ONE clarifying question to help you plan the next step. "
+                        "Be direct. Address them as Sir."
+                    )},
+                    {"role": "user", "content": query},
+                ])
+                if graceful and graceful.strip():
+                    return {
+                        "text": graceful.strip(),
+                        "tools_used": [],
+                        "execution_id": None,
+                        "plan_steps": 0,
+                        "mode": "clarify_fallback",
+                    }
+            except Exception as e:
+                logger.warning(f"[Planner] Graceful fallback LLM call failed: {e}")
             return {
-                "text": response,
+                "text": (
+                    "That sounds interesting, Sir. Could you give me a bit more detail "
+                    "so I can put together a solid plan for you?"
+                ),
                 "tools_used": [],
                 "execution_id": None,
                 "plan_steps": 0,
-                "mode": "fallback",
+                "mode": "clarify_fallback",
             }
 
-        # 3. Register with execution engine
-        execution_id = await self.execution_engine.execute_plan(plan, session_id)
+        # Format plan as JARVIS-style approval request
+        plan_text = self._format_plan_for_approval(query, plan)
 
-        step_count = len(plan.steps)
-        self.loop._status(f"Plan ready: {step_count} steps. Execution started.")
-
+        logger.info(f"[Planner] Plan ready ({len(plan.steps)} steps) — awaiting approval")
         return {
-            "text": "Understood, Sir. On it.",
+            "text": plan_text,
+            "tools_used": [],
+            "execution_id": None,
+            "plan_steps": len(plan.steps),
+            "mode": "awaiting_approval",
+            "pending_plan": plan,   # SmartRouter stores this, fires after 'yes'
+        }
+
+    async def fire_plan(self, plan, session_id: str) -> Dict[str, Any]:
+        """
+        PHASE 2: called by SmartRouter when user approves the plan.
+        Submits the pre-built plan to the ExecutionEngine immediately.
+        """
+        execution_id = await self.execution_engine.execute_plan(plan, session_id)
+        step_count = len(plan.steps)
+        self.loop._status(f"Executing {step_count}-step plan...")
+        logger.info(f"[Planner] Fired plan {plan.plan_id[:8]} — {step_count} steps")
+        return {
+            "text": (
+                f"On it, Sir. Executing {step_count} steps in the background. "
+                "I'll update you when each step completes."
+            ),
             "tools_used": [s.tool_category for s in plan.steps],
             "execution_id": execution_id,
             "plan_steps": step_count,
@@ -242,7 +288,32 @@ class MultiAgentPlanner:
 
         return "\n\n".join(ctx_parts)
 
-    # ── Formatting ────────────────────────────────────────────────────────
+    def _format_plan_for_approval(self, query: str, plan) -> str:
+        """
+        JARVIS-style plan presentation.
+        Shows the user exactly what will happen before a single tool fires.
+        """
+        est_total = plan.estimated_duration_seconds
+        if est_total < 60:
+            est_str = f"~{est_total}s"
+        else:
+            est_str = f"~{est_total // 60}m {est_total % 60}s"
+
+        lines = [
+            f"Here's my plan for: *{query[:80]}*",
+            "",
+        ]
+        for step in plan.steps:
+            tag = f"[{step.tool_category.upper()}]"
+            lines.append(f"  {step.step_number}. {tag} {step.action}")
+
+        lines.extend([
+            "",
+            f"Estimated time: {est_str}  |  {len(plan.steps)} steps",
+            "",
+            "Shall I proceed, Sir?",
+        ])
+        return "\n".join(lines)
 
     def _format_plan_preview(self, plan) -> str:
         lines = []

@@ -6,7 +6,7 @@ import logging
 from typing import List, Dict, Any, Callable, Optional
 from friday.llm.base import LLMProvider
 import datetime
-from friday.memory.layers.layer_3_episodic import FactStore, extract_facts
+from friday.memory.layers.layer_3_episodic import FactStore
 from friday.agents.friday.session_repair import repair_tool_use_result_pairing, extract_identifiers
 
 LLM_TIMEOUT_SECONDS = 60
@@ -41,35 +41,7 @@ def estimate_message_tokens(msg: Dict[str, str]) -> int:
     return estimate_tokens(msg.get("content", "")) + 4
 
 
-class FeedbackDetector:
-    PATTERNS = [
-        (r'(?:call me|address me as|my name is|i am)\s+([\w]+)', 'address_as', 1),
-        (r'(?:be more|be)\s+(concise|brief|short|verbose|detailed|formal|casual|friendly)', 'response_style', 1),
-        (r'(?:keep.+(?:short|brief|concise))', 'response_style', 'concise'),
-        (r'(?:too long|too verbose|shorten)', 'response_style', 'concise'),
-        (r'(?:be more|sound more)\s+(serious|funny|playful|warm|professional|chill)', 'tone', 1),
-        (r"(?:don'?t use)\s+(?:emojis?)", 'use_emojis', 'no'),
-        (r'(?:use)\s+(?:emojis?)', 'use_emojis', 'yes'),
-    ]
 
-    def __init__(self, personalization):
-        self.personalization = personalization
-        self._compiled = [(re.compile(p, re.IGNORECASE), k, v) for p, k, v in self.PATTERNS]
-
-    def detect_and_save(self, user_message: str) -> list:
-        if not self.personalization:
-            return []
-        saved = []
-        for pattern, pref_key, value_spec in self._compiled:
-            match = pattern.search(user_message)
-            if match:
-                value = match.group(value_spec) if isinstance(value_spec, int) else value_spec
-                value = value.strip()
-                current = self.personalization.get_preference(pref_key)
-                if current != value:
-                    self.personalization.update_preference(pref_key, value)
-                    saved.append((pref_key, value))
-        return saved
 
 
 SYSTEM_PROMPT = """You are Friday, a highly intelligent, formal, and concise personal AI assistant with persistent memory.
@@ -85,10 +57,19 @@ CRITICAL INTELLIGENCE RULES:
 8. TEMPORAL ACCURACY: For schedules and upcoming events, rely EXCLUSIVELY on [ABSOLUTE CONTINUOUS ITINERARY]. Ignore [Memory context] for dates, as it contains historical/outdated snippets.
 {user_rules}
 
-To use a tool, output ONLY a JSON block:
-```json
+KNOWLEDGE PROTOCOL:
+- When user states a stable fact about themselves → call remember_fact() silently
+- When user corrects a stored fact → call update_fact() silently
+- When user says something that contradicts what you know → call forget_fact() then remember_fact()
+- When user explicitly sets a behavioral preference → call remember_pattern() silently
+- When user corrects a past pattern → call update_pattern() silently
+- When user expresses any preference, habit, or name/title → call store_personalization() silently
+- NEVER say "I've noted that", "I'll remember", or any variant. Store silently. Just respond naturally.
+
+To use a tool, you MUST wrap the JSON exactly inside <tool_call> and </tool_call> tags:
+<tool_call>
 {{"name": "tool_name", "arguments": {{"arg": "val"}}}}
-```
+</tool_call>
 Then STOP.
 
 Tools:
@@ -110,16 +91,16 @@ class AgentLoop:
         self.session_manager = session_manager
         self.session_id = session_id
         self.personalization = personalization
-        # FeedbackDetector is kept as a lightweight fallback for instant patterns
-        # but LLM auto-tooling now handles the majority of preference learning.
-        self.feedback_detector = FeedbackDetector(personalization) if personalization else None
         self._status_callback = None
         self._history: List[Dict[str, str]] = []
         self._history_loaded = False
         self._summary_cache: str = ""
         self._compacted_up_to: int = 0
-        self._reflect_at: int = 0  # tracks when next Reflection should run
-        self._searcher = None  # injected by terminal_chat for pre-search
+        self._reflect_at: int = 0    # tracks when next Reflection runs
+        self._extract_at: int = 0    # tracks when next KnowledgeExtraction runs
+        self._knowledge_extractor = None  # injected after construction
+        self._searcher = None      # injected by terminal_chat for pre-search
+        self._live_ctx = None      # LiveContextState — injected after construction
 
     def register_tool(self, name: str, func: Callable, schema: Dict[str, Any]):
         self.tools[name] = func
@@ -147,13 +128,27 @@ class AgentLoop:
                 rules.append("- No emojis.")
             if rules:
                 user_rules = "\n".join(rules) + "\n"
-                
-        # Fetch precise timezone-aware time to prevent Windows OS clock drift
-        local_now = datetime.datetime.now(datetime.timezone.utc).astimezone()
-        now_str = local_now.strftime("%A, %B %d, %Y, %I:%M %p %Z").strip()
-        time_injection = f"\nCURRENT SYSTEM TIME: {now_str}\n"
 
-        return SYSTEM_PROMPT.format(tools_schema=tools_str, user_rules=user_rules) + time_injection
+        # ── LIVE CONTEXT: always-on brain awareness ───────────────────────────
+        # LiveContextState is refreshed by a background loop every N seconds,
+        # independently of user input. The brain is ALWAYS aware of:
+        #   - Current time
+        #   - Upcoming events / itinerary
+        #   - Running execution status
+        #   - Day-before reminders
+        #   - Pending plan approvals
+        #   - Scheduling conflicts
+        live_block = ""
+        if self._live_ctx is not None:
+            live_block = self._live_ctx.as_system_block()
+        elif self.fact_store:
+            # Fallback if live context loop hasn't started yet: use current time only
+            local_now = datetime.datetime.now(datetime.timezone.utc).astimezone()
+            live_block = f"[LIVE — Current Time: {local_now.strftime('%A, %B %d, %Y — %I:%M %p %Z').strip()}]"
+
+        live_injection = ("\n" + live_block + "\n") if live_block else ""
+
+        return SYSTEM_PROMPT.format(tools_schema=tools_str, user_rules=user_rules) + live_injection
 
     def _load_history(self):
         if self._history_loaded or not self.session_manager:
@@ -470,43 +465,26 @@ class AgentLoop:
             f" Summary unavailable due to size limits."
         )
 
-    def _fix_json_keys(self, text: str) -> str:
-        fixed = re.sub(r'(\{|,)\s*(\w+)\s*:', r'\1 "\2":', text)
-        for tn in self.tools.keys():
-            fixed = re.sub(rf'"name"\s*:\s*{re.escape(tn)}', f'"name": "{tn}"', fixed)
-        return fixed
-
     def _extract_action(self, text: str) -> Optional[Dict[str, Any]]:
-        if "```json" in text:
-            try:
-                json_str = text.split("```json")[-1].split("```")[0].strip()
-                json_str = self._fix_json_keys(json_str)
-                parsed = json.loads(json_str)
-                if isinstance(parsed, dict) and "name" in parsed:
-                    return parsed
-            except Exception:
-                pass
+        # 1. Primary: Extract from strict <tool_call> tags
+        match = re.search(r'<tool_call>(.*?)</tool_call>', text, re.DOTALL | re.IGNORECASE)
+        candidate = None
+        
+        if match:
+            candidate = match.group(1).strip()
+        else:
+            # 2. Backward compatibility fallback: Markdown blocks
+            if "```json" in text:
+                candidate = text.split("```json")[-1].split("```")[0].strip()
 
-        if "{" in text and "name" in text:
-            depth = 0
-            start = -1
-            for i, c in enumerate(text):
-                if c == '{':
-                    if depth == 0:
-                        start = i
-                    depth += 1
-                elif c == '}':
-                    depth -= 1
-                    if depth == 0 and start >= 0:
-                        candidate = text[start:i+1]
-                        try:
-                            fixed = self._fix_json_keys(candidate)
-                            parsed = json.loads(fixed)
-                            if isinstance(parsed, dict) and "name" in parsed:
-                                return parsed
-                        except Exception:
-                            pass
-                        start = -1
+        if candidate:
+            # We explicitly let json.loads raise JSONDecodeError so AgentLoop can self-correct
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict) and "name" in parsed:
+                return parsed
+            else:
+                raise ValueError("Parsed JSON is not a dictionary containing a 'name' key.")
+
         return None
 
     async def _pre_search(self, user_message: str) -> str:
@@ -530,7 +508,7 @@ class AgentLoop:
 
     async def _maybe_reflect(self):
         """Background Reflection agent: every 12 messages, silently scans chat history
-        for new stable facts/preferences and autonomously saves them."""
+        for new stable facts/preferences and autonomously saves them to Layer 6 (Profile)."""
         total = len(self._history)
         if total < self._reflect_at + 12:
             return
@@ -564,7 +542,6 @@ class AgentLoop:
                 {"role": "system", "content": "You are a silent observer extracting stable user attributes from conversation logs. Output ONLY valid JSON."},
                 {"role": "user", "content": reflection_prompt}
             ])
-            # Extract JSON from response
             text = result_text.strip()
             if "[" in text:
                 text = text[text.index("["):text.rindex("]")+1]
@@ -584,6 +561,22 @@ class AgentLoop:
         except Exception as e:
             logger.debug(f"Reflection agent failed silently: {e}")
 
+    async def _maybe_extract_knowledge(self):
+        """
+        Background KnowledgeExtractor: every 20 messages, fires KnowledgeExtractor
+        to extract Layer 4 (semantic facts) and Layer 5 (behavioral patterns).
+        Runs as asyncio.create_task() — zero impact on response latency.
+        """
+        total = len(self._history)
+        if total < self._extract_at + 20:
+            return
+        if not self._knowledge_extractor:
+            return
+        self._extract_at = total
+        asyncio.create_task(
+            self._knowledge_extractor.run_once(self._history[-25:])
+        )
+
     async def run(self, user_message: str, max_steps: int = 5) -> str:
         # Acquire session write-lock to prevent concurrent corruption
         if self.session_manager:
@@ -598,157 +591,22 @@ class AgentLoop:
         """Main agent loop body, runs under session write-lock."""
         self._load_history()
 
-        # FeedbackDetector: still handles instant, obvious patterns (name, emojis)
-        # The LLM auto-tooling (LEARNING PROTOCOL rule) handles everything natural
-        if self.feedback_detector:
-            self.feedback_detector.detect_and_save(user_message)
-
-        # Compaction runs AFTER the response is returned (non-blocking).
-        # This eliminates the "[Summarizing older context...]" delay on the hot path.
-        # The summary will be ready in the DB cache before the NEXT user message.
-
         # Background Reflection: silently learns from conversation every 12 messages
         await self._maybe_reflect()
 
+        # Background Knowledge Extraction: L4 + L5 update every 20 messages
+        await self._maybe_extract_knowledge()
+
         # Auto-search memory BEFORE LLM call — injects relevant memories as context
         memory_context = await self._pre_search(user_message)
-        
-        # EXTRACT FACTS AND CHECK CONFLICTS
-        active_facts_context = ""
-        system_conflict_warning = ""
-        reminder_context = ""
-        if self.fact_store:
-            # 1. Extract ops blind to context
-            extraction_res = extract_facts(user_message)
-            ops = extraction_res.get("operations", [])
 
-            # Apply ops safely behind the scenes
-            for op in ops:
-                try:
-                    if op.get("action") == "add" and op.get("content") and op.get("date_start"):
-                        start_dt = datetime.datetime.fromisoformat(op["date_start"])
-                        end_dt = datetime.datetime.fromisoformat(op["date_end"]) if op.get("date_end") else start_dt
-                        self.fact_store.add_fact(
-                            op["content"], 
-                            start_dt, 
-                            end_dt,
-                            float(op.get("importance", 0.5))
-                        )
-                    elif op.get("action") == "delete" and op.get("keyword"):
-                        self.fact_store.delete_fact(op["keyword"])
-                except Exception as e:
-                    logger.warning(f"Error applying fact operation {op}: {e}")
-
-            # 2. Run the offline mathematical linter
-            self.fact_store.lint_memory_conflicts()
-
-            # 3. Warn about ALL contested future events — no urgency gate.
-            #    Every conflict matters, whether it's tomorrow or 4 months out.
-            contested = self.fact_store.get_contested_facts()
-            if contested:
-                now_dt = datetime.datetime.now()
-                lines = []
-                for f in contested:
-                    try:
-                        ds = datetime.datetime.fromisoformat(f["date_start"]).replace(tzinfo=None)
-                        days_until = (ds.date() - now_dt.date()).days
-                        if days_until < 0:
-                            continue  # already expired, skip
-                        if days_until == 0:
-                            label = "TODAY"
-                        elif days_until == 1:
-                            label = "TOMORROW"
-                        else:
-                            label = f"{days_until} days away"
-                        f_date = ds.strftime("%a %b %d")
-                        lines.append(f"- {f_date} ({label}): {f['content']}")
-                    except Exception:
-                        pass
-                if lines:
-                    system_conflict_warning = (
-                        "[SYSTEM WARNING: CONFLICTING EVENTS DETECTED — "
-                        "these events have overlapping times and must be resolved:]\n"
-                        + "\n".join(lines) + "\n"
-                    )
-
-            # 4. Build the full infinite-horizon itinerary with countdown labels.
-            #    The LLM sees ALL future events and how many days remain —
-            #    rule #1 in the system prompt keeps it silent unless asked.
-            current_active = self.fact_store.get_active_facts()  # no day cap
-            if current_active:
-                now_dt = datetime.datetime.now()
-                lines = []
-                for f in current_active:
-                    try:
-                        ds = datetime.datetime.fromisoformat(f["date_start"]).replace(tzinfo=None)
-                        de = datetime.datetime.fromisoformat(f["date_end"]).replace(tzinfo=None)
-                        days_until = (ds.date() - now_dt.date()).days
-
-                        if days_until < 0:
-                            day_label = f"ONGOING (started {-days_until} days ago)"
-                        elif days_until == 0:
-                            day_label = f"TODAY {ds.strftime('%I:%M %p')}-{de.strftime('%I:%M %p')}"
-                        elif days_until == 1:
-                            day_label = f"TOMORROW {ds.strftime('%I:%M %p')}"
-                        else:
-                            day_label = f"{ds.strftime('%a %b %d')} ({days_until} days away)"
-
-                        lines.append(f"- {day_label}: {f['content']}")
-                    except Exception:
-                        pass
-                if lines:
-                    active_facts_context = (
-                        "[ABSOLUTE CONTINUOUS ITINERARY — ALL UPCOMING EVENTS]\n"
-                        + "\n".join(lines) + "\n"
-                    )
-
-            # 5. Day-before reminder — inject a prominent block for events
-            #    starting in the next 20-48 hours that haven't been reminded yet.
-            #    Unlike the silent itinerary, the LLM IS expected to mention this.
-            reminder_context = ""
-            if self.fact_store:
-                try:
-                    reminder_events = self.fact_store.get_events_needing_reminder()
-                    if reminder_events:
-                        reminder_lines = []
-                        for rev in reminder_events:
-                            try:
-                                ds = datetime.datetime.fromisoformat(rev["date_start"]).replace(tzinfo=None)
-                                de = datetime.datetime.fromisoformat(rev["date_end"]).replace(tzinfo=None)
-                                now_dt = datetime.datetime.now()
-                                hours_until = max(0, int((ds - now_dt).total_seconds() // 3600))
-                                reminder_lines.append(
-                                    f"- {ds.strftime('%A %b %d at %I:%M %p')} "
-                                    f"(in ~{hours_until} hours): {rev['content']}"
-                                )
-                                # Mark as reminded so this never fires again for this event
-                                self.fact_store.mark_reminder_sent(rev["id"])
-                            except Exception:
-                                pass
-                        if reminder_lines:
-                            reminder_context = (
-                                "[\U0001f514 REMINDER — UPCOMING TOMORROW]\n"
-                                "These events start within the next 24-48 hours. "
-                                "Proactively mention this to the user.\n"
-                                + "\n".join(reminder_lines) + "\n"
-                            )
-                except Exception as e:
-                    logger.warning(f"Reminder check failed: {e}")
-
-        # Prepend memory context to the user message so the LLM always sees it
+        # Context assembly is handled by ContextAssembler (called by SmartRouter before routing).
+        # AgentLoop only adds memory search context here — calendar/itinerary/conflicts are
+        # already embedded in the augmented_message when this is called by MediumHandler.
+        # When called directly (legacy path), we still inject memory context.
         augmented_message = user_message
-        context_parts = []
-        if reminder_context:                  # 🔔 Reminders first — highest priority
-            context_parts.append(reminder_context)
-        if active_facts_context:
-            context_parts.append(active_facts_context)
-        if system_conflict_warning:
-            context_parts.append(system_conflict_warning)
         if memory_context:
-            context_parts.append(memory_context)
-            
-        if context_parts:
-            augmented_message = "\n".join(context_parts) + f"\nUser: {user_message}"
+            augmented_message = memory_context + f"\nUser: {user_message}"
 
         messages = self._assemble_context(augmented_message)
 
@@ -756,13 +614,31 @@ class AgentLoop:
         self._status("Generating response...")
 
         response_content = None
+        _tool_not_found: bool = False    # True when we exhaust retries for missing tool
+        _missing_tool_strikes: int = 0  # consecutive "tool not found" counter (max 1 retry)
+
         for step in range(max_steps):
             try:
                 content = await self._llm_call(messages)
                 messages.append({"role": "assistant", "content": content})
 
-                action = self._extract_action(content)
+                try:
+                    action = self._extract_action(content)
+                except json.JSONDecodeError as e:
+                    self._persist("assistant", content)
+                    error_msg = f"System Error: Invalid JSON syntax in tool call. {str(e)}. Please fix the JSON syntax and try again."
+                    self._persist("user", error_msg)
+                    messages.append({"role": "user", "content": error_msg})
+                    continue
+                except ValueError as e:
+                    self._persist("assistant", content)
+                    error_msg = f"System Error: Invalid tool structure. {str(e)}. Please fix and try again."
+                    self._persist("user", error_msg)
+                    messages.append({"role": "user", "content": error_msg})
+                    continue
+
                 if not action:
+                    # Clean exit — LLM gave a plain-text answer, no tool needed
                     self._persist("assistant", content)
                     response_content = content
                     break
@@ -772,16 +648,48 @@ class AgentLoop:
                 tool_args = action.get("arguments", {})
 
                 if tool_name in self.tools:
+                    # ── Tool exists: execute it and feed result back ──────────
+                    _missing_tool_strikes = 0   # reset on a successful tool hit
                     try:
                         result = await self.tools[tool_name](**tool_args)
                         result_msg = f"Result: {result}"
                     except Exception as e:
                         result_msg = f"Result: Tool {tool_name} failed: {e}"
-                else:
-                    result_msg = f"Result: Tool '{tool_name}' not found. Available: {list(self.tools.keys())}"
+                    self._persist("user", result_msg)
+                    messages.append({"role": "user", "content": result_msg})
 
-                self._persist("user", result_msg)
-                messages.append({"role": "user", "content": result_msg})
+                else:
+                    # ── Tool NOT found ───────────────────────────────────────
+                    _missing_tool_strikes += 1
+
+                    if _missing_tool_strikes == 1:
+                        # First miss — give the LLM one chance to self-correct.
+                        # Feed back the error WITH the available tool list so it
+                        # can pick the closest real tool (e.g. open_url instead
+                        # of play_music) and correct itself on the next step.
+                        logger.warning(
+                            f"[AgentLoop] Tool '{tool_name}' not registered "
+                            f"(step {step+1}/{max_steps}) — allowing 1 retry"
+                        )
+                        correction_msg = (
+                            f"Tool '{tool_name}' is not available. "
+                            f"Available tools: {list(self.tools.keys())}. "
+                            f"Use one of those, or answer the user directly in plain text "
+                            f"if none of them are suitable."
+                        )
+                        self._persist("user", correction_msg)
+                        messages.append({"role": "user", "content": correction_msg})
+                        # Continue loop — LLM gets another shot
+
+                    else:
+                        # Second consecutive miss — LLM still can't find a valid tool.
+                        # Break now; graceful fallback will answer below.
+                        logger.warning(
+                            f"[AgentLoop] Tool '{tool_name}' not registered on retry "
+                            f"(step {step+1}/{max_steps}) — exiting loop for direct answer"
+                        )
+                        _tool_not_found = True
+                        break
 
             except asyncio.TimeoutError:
                 response_content = "Response timed out. Please try again."
@@ -791,8 +699,34 @@ class AgentLoop:
                 response_content = f"Error: {type(e).__name__}. Please try again."
                 break
 
+        # ── Graceful fallback when loop didn't produce a clean answer ────────
+        # Covers two cases:
+        #   1. Tool not found after retry — LLM wanted a capability Friday doesn't have
+        #   2. Max steps hit              — LLM never converged (shouldn't happen with
+        #                                   real tools, but is now always safe)
         if response_content is None:
-            response_content = "Max reasoning steps reached."
+            fallback_reason = "tool not available after retry" if _tool_not_found else "max steps hit"
+            logger.warning(f"[AgentLoop] No clean response ({fallback_reason}) — direct LLM fallback")
+            try:
+                # One bare LLM call: NO tool schema injected so the model can't
+                # try to call a tool again — it MUST answer in plain text.
+                direct_messages = [
+                    {"role": "system", "content": (
+                        "You are Friday, a concise and honest personal AI assistant. "
+                        "Answer the user's question directly in 1-2 sentences. "
+                        "If you don't have access to the required data (such as emails, "
+                        "files, or external services not available to you), say so clearly "
+                        "and briefly state what you CAN help with instead. "
+                        "Be natural and helpful. Address the user as Sir."
+                    )},
+                    {"role": "user", "content": user_message},
+                ]
+                fallback = await self._llm_call(direct_messages)
+                response_content = fallback.strip() if fallback and fallback.strip() \
+                    else "I don't have access to that right now, Sir."
+            except Exception as e:
+                logger.error(f"[AgentLoop] Direct fallback LLM call also failed: {e}")
+                response_content = "I don't have access to that right now, Sir."
 
         # Fire compaction in the background AFTER returning the response.
         # Zero impact on response latency. Summary cached for next turn.

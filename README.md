@@ -17,7 +17,8 @@ Every user message is classified and routed to the right handler automatically:
 |------|---------|-----------|----------------|
 | **Simple** | `SimpleHandler` | Greetings, facts, calendar lookups. Now fully context-aware via lightweight LLM for chat. | < 500ms |
 | **Medium** | `MediumHandler` (AgentLoop) | Requires 1-3 tools (web search, calculator, memory) | < 2s |
-| **Complex** | `MultiAgentPlanner` + ExecutionEngine | Multi-step research, parallel agent coordination | Background |
+| **Complex** | `MultiAgentPlanner` + ExecutionEngine | Explicit multi-step projects and planning | Background |
+| **Clarify** | Graceful Fallback | Used when requests are too vague or the user is just pitching an idea | < 1s |
 
 Classification uses an **LLM router** with a **regex fallback classifier** — if the LLM is slow, regex takes over instantly.
 
@@ -35,13 +36,12 @@ Friday's memory is not a flat conversation log. It's a structured, tiered system
 
 Memory is automatically written in the background after **every** user message via an async pipeline — the user never waits for it.
 
-### 🔍 Hybrid Memory Search
-Memory retrieval uses a **vector + BM25 keyword hybrid search**:
-- **sqlite-vec** for cosine-similarity vector search (semantic understanding)
-- **SQLite FTS5** for BM25 keyword search (exact term matching)
-- **LIKE fallback** when FTS5 returns nothing
-- **Redis caching** on top of all search results for speed
-- Results are automatically injected into every LLM call as context
+### 🔍 Search & Specialized RAG
+The core memory system uses a pure **SQLite FTS5 keyword search** for lightning-fast, reliable retrieval. This guarantees sub-10ms memory lookups during the hot path of every conversation.
+For deep document research, Friday delegates to a **Specialized RAG Agent** that handles:
+- Cosine-similarity vector search
+- Maximal Marginal Relevance (MMR) ranking
+- Optional Redis caching for embeddings
 
 ### 📅 Calendar & Conflict Detection
 - Friday **automatically extracts events** from natural language (e.g. "I have a meeting on Friday at 3pm")
@@ -94,9 +94,9 @@ The full awareness layer is designed:
 **Status**: Not yet started on server boot — scheduler is defined but not launched in `terminal_chat.py`.
 
 ### Redis Embedding Cache
-`cache/embedding_cache.py` and `cache/redis_client.py` exist.
+Redis caching exists for the specialized RAG agent's vector embeddings.
 
-**Status**: Redis search caching is active in `HybridSearcher`. Embedding caching is written but **not yet injected** into `EmbeddingManager`.
+**Status**: It is implemented inside the RAG agent's vector system but disabled by default.
 
 ---
 
@@ -119,13 +119,12 @@ The full awareness layer is designed:
 
 ## Known Flaws & Limitations 🐛
 
-1. **Redis is optional but silently fails** — if Redis isn't running, the search cache silently no-ops. This is by design, but no warning is shown to the user.
-2. **Complex tier is untested end-to-end** — the `MultiAgentPlanner` → `ExecutionEngine` → specialized agent chain has no real agents at the end of it.
-3. **No tests** — the `friday/tests/` folder is empty. `test_full_integration.py` and `test_llm_slots.py` exist at the root but are standalone scripts, not proper pytest suites.
-4. **Tool registry auto-discovery is designed but partial** — `tools/registry.py` has the pattern, but not all tool categories are populated (browser, MCP, memory tools).
-5. **Single DB connection (no pooling)** — `db_manager.get_connection()` returns a single connection without a pool, which will be a bottleneck under any concurrent load (e.g., when the API or Telegram adapters are added).
-6. **Context compaction summary drift** — the `_summary_cache` is stored in the `meta` table but is never invalidated or versioned. If the model changes, old summaries in a different "style" will persist.
-7. **No authentication or rate limiting** — the FastAPI server stub has no auth layer yet. This needs to be addressed before any public interface is deployed.
+1. **Complex tier is untested end-to-end** — the `MultiAgentPlanner` → `ExecutionEngine` → specialized agent chain has no real agents at the end of it (except the new RAG agent).
+2. **No tests** — the `friday/tests/` folder is empty. `test_full_integration.py` and `test_llm_slots.py` exist at the root but are standalone scripts, not proper pytest suites.
+3. **Tool registry auto-discovery is designed but partial** — `tools/registry.py` has the pattern, but not all tool categories are populated (browser, MCP, memory tools).
+4. **Single DB connection (no pooling)** — `db_manager.get_connection()` returns a single connection without a pool, which will be a bottleneck under any concurrent load (e.g., when the API or Telegram adapters are added).
+5. **Context compaction summary drift** — the `_summary_cache` is stored in the `meta` table but is never invalidated or versioned. If the model changes, old summaries in a different "style" will persist.
+6. **No authentication or rate limiting** — the FastAPI server stub has no auth layer yet. This needs to be addressed before any public interface is deployed.
 
 ---
 

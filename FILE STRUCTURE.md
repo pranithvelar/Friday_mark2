@@ -119,6 +119,14 @@ friday_mark2/
     │       │   ├── __init__.py
     │       │   ├── agent.py       ← EMPTY STUB
     │       │   └── prompts.py     ← EMPTY STUB
+    │       ├── rag/               ← ★ NEW: Specialized RAG Agent (Vectors + Embeddings)
+    │       │   ├── __init__.py
+    │       │   ├── agent.py       ← RAG Agent implementation
+    │       │   └── vector_system/ ← Vector components removed from core memory pipeline
+    │       │       ├── embedding_manager.py
+    │       │       ├── hybrid_search.py
+    │       │       ├── mmr.py
+    │       │       └── embedding_cache_redis.py
     │       ├── telegram/          ← Future Telegram agent
     │       │   ├── __init__.py
     │       │   └── agent.py       ← EMPTY STUB
@@ -154,26 +162,33 @@ friday_mark2/
     │
     ├── 🧩 memory/                 ← THE 6-LAYER MEMORY SYSTEM
     │   ├── __init__.py
-    │   ├── pipeline.py            ← ★ NEW: Runs asyncio.create_task on EVERY input
-    │   │                             Extracts facts → embeds → stores → promotes
-    │   ├── db_manager.py          ← SQLite R/W (FROM: src/database/db_manager.py)
+    │   ├── memory_core.py         ← ★ SINGLE PUBLIC INTERFACE: memory_remembering() + memory_retrieval()
+    │   │                             All agents/handlers import from here ONLY. No direct FactStore/pipeline calls.
+    │   ├── pipeline.py            ← Internal: indexes text (vector/BM25) and fires promotion. Pure background, no event logic.
+    │   ├── event_engine.py        ← ★ IMPLEMENTED: Hot-path event detection (regex+SQLite) and instant conflict return.
+    │   ├── context_assembler.py   ← Internal: builds ContextBundle with ALL 5 layers (L2+L3+L4+L5+L6)
+    │   ├── db_manager.py          ← SQLite R/W — also owns semantic_facts table (Layer 4)
     │   └── layers/
     │       ├── __init__.py
-    │       ├── layer_1_working.py     ← Current task context (what's happening NOW)
-    │       ├── layer_2_short_term.py  ← Recent conversation (FROM: src/memory/short_term.py)
-    │       ├── layer_3_episodic.py    ← Events / calendar facts (FROM: src/memory/facts.py)
-    │       ├── layer_4_semantic.py    ← Stable user knowledge (FROM: personalization part)
-    │       ├── layer_5_procedural.py  ← Learned habits / patterns
-    │       ├── layer_6_profile.py     ← Core profile (FROM: src/memory/personalization.py)
-    │       ├── promotion.py           ← (FROM: src/memory/promotion.py)
-    │       ├── dreaming.py            ← (FROM: src/memory/dreaming.py)
-    │       └── temporal_decay.py      ← (FROM: src/memory/temporal_decay.py)
+    │       ├── layer_2_short_term.py  ← Recent conversation recall (vector + FTS search)
+    │       ├── layer_3_episodic.py    ← Calendar events — EVENT_KEYWORDS (strict list, no project keywords)
+    │       │                             add_fact() returns {fact_id, conflict:[]} for immediate conflict detection
+    │       ├── layer_4_semantic.py    ← ★ IMPLEMENTED: SemanticMemory — inferred stable user facts
+    │       │                             Full CRUD: add/update/delete/search, confidence scoring, dedup
+    │       │                             Context injection: get_context_block() → LLM system prompt
+    │       ├── layer_5_procedural.py  ← ★ IMPLEMENTED: ProceduralMemory — behavioral patterns
+    │       │                             Wraps LearningEngine (reuses confidence/dedup logic)
+    │       │                             Full CRUD: add_pattern/correct_pattern/delete_pattern
+    │       │                             Context injection: get_context_block() → LLM system prompt
+    │       ├── layer_6_profile.py     ← Explicit user profile (stated facts, name, prefs)
+    │       ├── promotion.py           ← L2 → long-term promotion scoring
+    │       ├── dreaming.py            ← Crystallization from short-term to semantic memory
+    │       └── temporal_decay.py      ← Confidence decay over time
     │
     ├── 🔍 search/                 ← HOW Friday retrieves from memory
     │   ├── __init__.py
-    │   ├── hybrid_search.py       ← BM25 + vector (FROM: src/search/hybrid_search.py)
-    │   ├── mmr.py                 ← Maximal Marginal Relevance (FROM: src/search/mmr.py)
-    │   └── embedding_manager.py   ← Embed text → vectors (FROM: src/embeddings/)
+    │   ├── fts_search.py          ← ★ IMPLEMENTED: Pure FTS5 keyword search (Fast)
+    │   └── indexer.py             ← ★ IMPLEMENTED: Text Indexer for FTS5 (Fast)
     │
     ├── 🧪 reasoning/              ← HOW Friday thinks about problems
     │   ├── __init__.py

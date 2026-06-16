@@ -217,8 +217,8 @@ class SimpleHandler:
             base = "\n".join(lines)
 
         # Append conflict warning from bundle if present
-        if bundle and bundle.conflict_warning:
-            base += "\n\n" + bundle.conflict_warning
+        if bundle and bundle.conflict_ctx:
+            base += "\n\n" + bundle.conflict_ctx
 
         return base
 
@@ -261,8 +261,8 @@ class SimpleHandler:
         bundle: Optional["ContextBundle"] = None,
     ) -> str:
         # Use bundle itinerary if already assembled — avoids second DB hit
-        if bundle and bundle.itinerary_ctx:
-            return bundle.itinerary_ctx.replace(
+        if bundle and bundle.events_ctx:
+            return bundle.events_ctx.replace(
                 "[ABSOLUTE CONTINUOUS ITINERARY — ALL UPCOMING EVENTS]\n", ""
             ).strip()
 
@@ -321,13 +321,46 @@ class SimpleHandler:
         """
         Make a single LLM call with the system prompt + augmented message.
         Uses the injected AgentLoop's _llm_call() so we share one model instance.
+
+        Reads user preferences (response_style, tone, address_as) from
+        personalization so 'be concise' and other prefs actually take effect
+        in Simple tier — not just Medium/Complex.
         """
+        # Build dynamic rules from stored preferences
+        user_rules = []
+        if self.personalization:
+            prefs = self.personalization.profile.get("preferences", {})
+            facts = self.personalization.profile.get("facts", {})
+            name = facts.get("name") or prefs.get("address_as")
+            if name:
+                user_rules.append(f'Address the user as "{name}".')
+            if prefs.get("response_style") == "concise":
+                user_rules.append("Be VERY concise. 1 sentence maximum. No elaboration.")
+            if prefs.get("tone"):
+                user_rules.append(f"Use a {prefs['tone']} tone.")
+            if prefs.get("use_emojis") == "no":
+                user_rules.append("No emojis.")
+
+        rules_str = ("\nUser preferences to follow strictly:\n"
+                     + "\n".join(f"- {r}" for r in user_rules)) if user_rules else ""
+
+        system = (
+            "You are Friday, a highly intelligent, formal, and concise personal AI assistant "
+            "with persistent memory. "
+            "Use the provided context to give a personalized, memory-aware response. "
+            "NEVER mention tags, tools, or that you are an AI. "
+            "NEVER volunteer information from memory unless it is directly relevant to what the user asked. "
+            "Answer ONLY what was asked."
+            + rules_str
+        )
+
         messages = [
-            {"role": "system", "content": _SIMPLE_SYSTEM},
+            {"role": "system", "content": system},
             {"role": "user",   "content": augmented_message},
         ]
         response = await self._agent_loop._llm_call(messages)
         return response.strip() if response else ""
+
 
     # ──────────────────────────────────────────────────────────────────────
     # Helpers (unchanged from original)

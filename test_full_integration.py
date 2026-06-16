@@ -47,7 +47,7 @@ def test(name, func):
 db_manager = None
 personalization = None
 searcher = None
-embedder = None
+indexer = None
 session_mgr = None
 loop_agent = None
 tools_sys = None
@@ -73,7 +73,6 @@ def phase_1():
         os.makedirs("workspace", exist_ok=True)
         db_manager = MemoryDatabaseManager(db_path)
         db_manager.ensure_schema()
-        db_manager.ensure_vector_table(dimensions=768)
         conn = db_manager.get_connection()
         # Verify tables exist
         tables = [r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
@@ -102,7 +101,7 @@ def phase_1():
 # =============================================================================
 
 def phase_2():
-    global personalization, embedder, searcher
+    global personalization, indexer, searcher
     print("\n" + "=" * 60)
     print("PHASE 2: Memory System (6 layers)")
     print("=" * 60)
@@ -238,20 +237,15 @@ def phase_2():
 
     test("Dreaming pipeline init", test_dreaming)
 
-    # --- Search / Embeddings ---
+    # --- Search / Indexing ---
     def test_searcher_init():
-        from friday.search.hybrid_search import HybridSearcher
-        global embedder, searcher
+        from friday.search.fts_search import FTSSearcher
+        global indexer, searcher
 
-        class FakeEmbedder:
-            async def embed_query(self, text):
-                return [0.1] * 768
-
-        embedder = FakeEmbedder()
-        searcher = HybridSearcher(db_manager, embedder)
+        searcher = FTSSearcher(db_manager)
         assert searcher is not None
 
-    test("Search: HybridSearcher init (fake embeddings)", test_searcher_init)
+    test("Search: FTSSearcher init", test_searcher_init)
 
     def test_search_query():
         async def _search():
@@ -268,7 +262,7 @@ def phase_2():
     def test_groom_facts():
         async def _groom():
             from friday.memory.layers.layer_3_episodic import groom_facts
-            await groom_facts(db_manager, embedder, workspace_dir="workspace")
+            await groom_facts(db_manager, None, workspace_dir="workspace")
         asyncio.get_event_loop().run_until_complete(_groom())
 
     test("Layer 3: Groom expired facts", test_groom_facts)
@@ -423,19 +417,9 @@ def phase_3():
     if result:
         print(f"    -> {str(result)[:80]}")
 
-    # --- FeedbackDetector ---
-    def test_feedback_detector():
-        from friday.agents.friday.agent import FeedbackDetector
-        fd = FeedbackDetector(personalization)
-        saved = fd.detect_and_save("Call me Boss and be more chill")
-        assert len(saved) >= 1, f"Expected >=1 feedback saved, got {saved}"
-        # Verify persistence
-        assert personalization.get_preference("address_as") == "Boss"
-        return saved
-
-    result = test("FeedbackDetector: 'Call me Boss and be more chill'", test_feedback_detector)
-    if result:
-        print(f"    -> Saved: {result}")
+    # --- FeedbackDetector (Deprecated) ---
+    # Feedback detection logic has been migrated to the new LearningEngine
+    # and tool_preference schema during recent updates.
 
     # --- System prompt build ---
     def test_system_prompt():
@@ -721,7 +705,7 @@ def phase_6():
         pipeline = MemoryPipeline(
             db_manager=db_manager,
             personalization=personalization,
-            embedding_manager=None,  # skip embedding for test
+            indexer=None,  # skip indexing for test
             fact_store=fs,
             promotion_engine=None,   # skip promotion for test
         )
