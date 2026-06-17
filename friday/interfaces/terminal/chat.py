@@ -390,6 +390,36 @@ async def main():
 
     print(f"[OK] 9 BRAIN tools registered (L4 facts + L5 patterns + personalization)")
 
+    # 12b. ToolRegistry — auto-discover tools from tools/ subdirectories
+    # Any file that subclasses BaseTool is picked up automatically.
+    # Tools are registered into the AgentLoop so ALL tiers (BRAIN, Medium, Complex) see them.
+    # Safe: wrapped in try/except — discovery failure never blocks startup.
+    # Skip: if a tool name is already registered (no override of existing working tools).
+    from friday.tools.registry import ToolRegistry
+    _tool_registry = ToolRegistry()
+    try:
+        _discovered = _tool_registry.discover()
+        _newly_registered = 0
+        for _tname in _tool_registry.list_all():
+            if _tname in loop.tools:
+                # Already registered by ToolSystem or BRAIN tools — don't override.
+                logger.debug(f"[ToolRegistry] '{_tname}' already registered — skipping")
+                continue
+            _tinst = _tool_registry.get(_tname)
+            loop.register_tool(_tname, _tinst.run, _tinst.to_schema())
+            _newly_registered += 1
+        if _discovered > 0:
+            print(f"[OK] ToolRegistry: {_discovered} tool(s) discovered, "
+                  f"{_newly_registered} newly registered")
+        else:
+            print("[OK] ToolRegistry: ready — add tools to friday/tools/ to auto-register")
+    except Exception as _reg_err:
+        logger.warning(f"[ToolRegistry] Discovery failed (non-fatal): {_reg_err}")
+        _tool_registry = None
+
+    # Store registry on loop so ExecutionEngine can dispatch by tool_category.
+    loop._tool_registry = _tool_registry
+
     # 13. Smart Router (3-Tier Routing: Simple → Medium → Complex Multi-Agent)
     router = build_smart_router(
         agent_loop        = loop,

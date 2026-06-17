@@ -1,4 +1,4 @@
-﻿"""
+"""
 Execution Engine
 =================
 The autonomous execution loop that runs independently from the LLM conversation.
@@ -235,30 +235,125 @@ class ExecutionEngine:
         return False
 
     # ──────────────────────────────────────────────────────────────────────
-    # Tool execution (STUB — replace when integrating real tools)
+    # Tool execution — real dispatcher with stub fallback
     # ──────────────────────────────────────────────────────────────────────
+
+    # Maps planner tool_category strings → candidate tool names in loop.tools.
+    # Order matters: first match wins.
+    _CATEGORY_TOOL_MAP = {
+        "browser":  ["browser_action", "open_url", "web_browse", "browser"],
+        "search":   ["web_search", "search_web", "search_memory"],
+        "memory":   ["search_memory", "write_memory", "recall_fact"],
+        "bash":     ["run_bash", "bash", "shell_exec"],
+        "mcp":      ["mcp_call", "mcp"],
+        "calendar": ["add_event", "cancel_event"],
+        "none":     [],   # LLM reasoning only — no tool dispatched
+    }
 
     async def _execute_tool_stub(self, step) -> Dict[str, Any]:
         """
-        STUB: Simulates tool execution.
-        When you integrate real tools, replace this with a real tool dispatcher
-        that routes based on step.tool_category:
-          "browser"  → Playwright / Selenium tool
-          "search"   → HybridSearcher or web search API
-          "bash"     → shell command executor
-          "mcp"      → MCP protocol client
-          "memory"   → direct DB query
-          "none"     → LLM reasoning only
+        Real tool dispatcher.
+
+        Resolution order:
+          1. Direct match: step.tool_category == a registered tool name
+          2. Category map: _CATEGORY_TOOL_MAP[tool_category] → first registered hit
+          3. 'none' or unregistered category → LLM reasoning (_llm_execute_step)
+          4. Final fallback: original stub response (preserves old behavior)
+
+        Safe: every path is try/except. A missing or broken tool never crashes execution.
         """
-        # Small delay to simulate real work
+        tool_fn        = None
+        tool_name_used = None
+
+        # ── 1. Direct name match ──────────────────────────────────────────
+        if step.tool_category and step.tool_category in self.loop.tools:
+            tool_fn        = self.loop.tools[step.tool_category]
+            tool_name_used = step.tool_category
+
+        # ── 2. Category → candidate name lookup ──────────────────────────
+        if tool_fn is None:
+            candidates = self._CATEGORY_TOOL_MAP.get(step.tool_category, [])
+            for candidate in candidates:
+                if candidate in self.loop.tools:
+                    tool_fn        = self.loop.tools[candidate]
+                    tool_name_used = candidate
+                    break
+
+        # ── 3. Call the real tool ─────────────────────────────────────────
+        if tool_fn is not None:
+            try:
+                # Tools registered via BaseTool.run() accept **kwargs.
+                # Pass query= as primary key; action= as secondary for tools that prefer it.
+                result = await tool_fn(query=step.action, action=step.action)
+                return {
+                    "status": "success",
+                    "step":   step.step_number,
+                    "tool":   tool_name_used,
+                    "result": str(result)[:500],
+                }
+            except TypeError:
+                # Tool doesn't accept query= or action= — try bare call.
+                try:
+                    result = await tool_fn()
+                    return {
+                        "status": "success",
+                        "step":   step.step_number,
+                        "tool":   tool_name_used,
+                        "result": str(result)[:500],
+                    }
+                except Exception as e:
+                    logger.warning(f"[Engine] Tool '{tool_name_used}' failed (bare call): {e}")
+                    # Fall through to LLM execution below.
+            except Exception as e:
+                logger.warning(f"[Engine] Tool '{tool_name_used}' failed: {e}")
+                # Fall through to LLM execution below.
+
+        # ── 4. No tool matched or tool failed → LLM reasoning ────────────
+        if step.tool_category in ("none", "llm") or tool_fn is None:
+            try:
+                return await self._llm_execute_step(step)
+            except Exception as e:
+                logger.warning(f"[Engine] LLM step execution failed: {e}")
+                # Fall through to stub below.
+
+        # ── 5. Final fallback: original stub (preserves old behavior) ─────
         await asyncio.sleep(0.1)
         return {
             "status":  "stub",
             "step":    step.step_number,
             "action":  step.action,
             "tool":    step.tool_category,
-            "message": f"[Tool stub] Would execute '{step.action}' via {step.tool_category}",
+            "message": f"[No tool registered for '{step.tool_category}'] {step.action}",
         }
+
+    async def _llm_execute_step(self, step) -> Dict[str, Any]:
+        """
+        Use the AgentLoop LLM to reason through a step that has no registered tool.
+        Called for tool_category='none' or when no matching tool is found.
+        """
+        prompt = (
+            f"Complete this task step and provide a concrete result:\n\n"
+            f"Step {step.step_number}: {step.action}\n"
+            f"Reasoning: {step.reasoning}\n\n"
+            f"Respond with the result or output of completing this step. Be concise."
+        )
+        raw = await self.loop._llm_call([
+            {
+                "role": "system",
+                "content": (
+                    "You are Friday, an AI assistant completing one specific task step. "
+                    "Provide a factual, concrete result. Do not ask questions."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ])
+        return {
+            "status": "llm_executed",
+            "step":   step.step_number,
+            "tool":   "llm_reasoning",
+            "result": (raw or "").strip()[:500],
+        }
+
 
     # ──────────────────────────────────────────────────────────────────────
     # Replan on failure

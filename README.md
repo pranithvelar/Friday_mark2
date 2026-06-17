@@ -22,6 +22,14 @@ Every user message is classified and routed to the right handler automatically:
 
 Classification uses an **LLM router** (now intent-first, not trigger-phrase-first) with a **regex fallback classifier** — regex takes over instantly if the LLM is slow. The Clarify tier has a 3-strike auto-escalation: after 3 consecutive clarification questions in a session, Friday stops asking and starts building.
 
+### 🔧 Tool Registry & Auto-Discovery
+Every tool in `friday/tools/` that subclasses `BaseTool` is **automatically discovered and registered** into the `AgentLoop` at startup:
+- Zero configuration — just drop a file in the right folder
+- `BaseTool.to_schema()` auto-generates the LLM-facing JSON schema
+- Duplicate names are skipped (existing BRAIN tools are never overridden)
+- Registry is stored on `loop._tool_registry` so both `AgentLoop` and `ExecutionEngine` can dispatch through it
+- Scope field (`"general"` vs `"brain"`) controls which tiers see the tool
+
 ### 🔗 Chain-of-Thought Reasoning (All Tiers)
 Every LLM response in Friday — whether answering directly, calling a tool, or generating a multi-step plan — is now preceded by a private `<thought>` reasoning block:
 
@@ -129,15 +137,17 @@ The only currently active interface is the terminal (`python terminal_chat.py`).
 ## What Has Been Built But Is Not Fully Wired Yet ⚠️
 
 ### Multi-Agent Execution Engine
-The full `execution/` layer is architected and coded:
-- `ExecutionEngine` — async task runner
+The full `execution/` layer is fully implemented and now dispatches real tools:
+- `ExecutionEngine` — async task runner with **real tool dispatching** (not a stub)
+- **4-stage dispatch**: direct name match → `_CATEGORY_TOOL_MAP` lookup → `_llm_execute_step` reasoning → stub fallback
+- `_llm_execute_step` — when no real tool is registered for a step, the LLM reasons through it directly
 - `ParallelExecutor` — `asyncio.gather` for concurrent agents
 - `SeriesExecutor` — chain agents where output feeds next
 - `MemoryAwareExecutor` — pre-checks memory before running a step
 - `LearningEngine` — records success/failure post-execution
 - `ExecutionStateManager` — tracks all running executions
 
-**Status**: The `MultiAgentPlanner` presents plans and fires `fire_plan()` on approval. However, **specialized agents** (`researcher`, `telegram`, `whatsapp`) are still empty stubs — no real execution work happens at the end of the chain yet.
+**Status**: Plans are generated, approved, and dispatched to the `ExecutionEngine` which now routes to real tools. **Specialized agents** (`researcher`, `telegram`, `whatsapp`) are still empty stubs — complex tasks resolve via LLM reasoning steps until those agents are built.
 
 ### Background Scheduler & Goal Tracker
 `scheduler.py` (APScheduler-based) and `goal_tracker.py` are implemented. `ProactiveEventsWatcher`, `GoogleWorkspaceWatcher`, and the new `MemoryDecayWatcher` are all registered.
@@ -164,9 +174,9 @@ The full `execution/` layer is architected and coded:
 
 ## Known Flaws & Limitations 🐛
 
-1. **Specialized agents are stubs** — Complex-tier plan execution reaches the `ExecutionEngine` but the endpoint agents (`researcher`, etc.) don't do real work yet. Plans are generated and shown to the user but execution is largely a no-op.
+1. **Specialized agents are stubs** — `researcher`, `telegram`, `whatsapp` agents exist but don't do real work. Complex plan steps resolve via LLM reasoning (`_llm_execute_step`) until these are built.
 2. **No tests** — `friday/tests/` is empty. `test_full_integration.py` at root is a standalone script, not a pytest suite.
-3. **Tool registry auto-discovery is partial** — `tools/registry.py` has the pattern, but browser and MCP tool categories are empty.
+3. **Tool registry auto-discovery covers `BaseTool` subclasses only** — any tool not subclassing `BaseTool` won't be auto-discovered. Browser and MCP slots are defined but empty.
 4. **Single DB connection (no pooling)** — `db_manager.get_connection()` returns a single connection without a pool, which will bottleneck under concurrent load when API/Telegram adapters are added.
 5. **Context compaction summary drift** — `_summary_cache` is stored in the `meta` table but never invalidated on model change. Old summaries from a different model style will persist.
 6. **No authentication or rate limiting** — The FastAPI server stub has no auth layer yet.
