@@ -41,6 +41,15 @@ def estimate_message_tokens(msg: Dict[str, str]) -> int:
     return estimate_tokens(msg.get("content", "")) + 4
 
 
+# ── Chain of Thought: strip <thought>...</thought> before showing output to user ──
+# The thought block is preserved in session history (helps multi-step reasoning)
+# but is never shown in the terminal or returned to any caller.
+_THOUGHT_RE = re.compile(r'<thought>.*?</thought>\s*', re.DOTALL | re.IGNORECASE)
+
+def _strip_thought_block(text: str) -> str:
+    """Remove <thought>...</thought> reasoning blocks from LLM output.
+    Friday's internal scratchpad — never shown to the user."""
+    return _THOUGHT_RE.sub('', text).strip()
 
 
 
@@ -56,7 +65,6 @@ CRITICAL INTELLIGENCE RULES:
 7. If [SYSTEM WARNING] about conflicts exists, mention it ONCE briefly.
 8. TEMPORAL ACCURACY: For schedules and upcoming events, rely EXCLUSIVELY on [ABSOLUTE CONTINUOUS ITINERARY]. Ignore [Memory context] for dates, as it contains historical/outdated snippets.
 {user_rules}
-
 KNOWLEDGE PROTOCOL:
 - When user states a stable fact about themselves → call remember_fact() silently
 - When user corrects a stored fact → call update_fact() silently
@@ -65,6 +73,20 @@ KNOWLEDGE PROTOCOL:
 - When user corrects a past pattern → call update_pattern() silently
 - When user expresses any preference, habit, or name/title → call store_personalization() silently
 - NEVER say "I've noted that", "I'll remember", or any variant. Store silently. Just respond naturally.
+
+CHAIN OF THOUGHT PROTOCOL:
+Before EVERY response — whether using a tool or answering directly — output a private
+reasoning block first:
+<thought>
+1. What is the user actually asking for?
+2. Scan the Tools list above. Is there a tool that covers this request?
+   - YES → call it. State which tool and what arguments.
+   - NO  → I do not have this capability. I must say so honestly and briefly.
+           Never guess, never fabricate, never claim access I don't have.
+3. If using memory context: does it directly answer the question, or is it just background?
+Keep under 4 sentences total.
+</thought>
+Then output your tool call OR your plain-text answer. The <thought> block is NEVER shown to the user.
 
 To use a tool, you MUST wrap the JSON exactly inside <tool_call> and </tool_call> tags:
 <tool_call>
@@ -99,6 +121,7 @@ class AgentLoop:
         self._reflect_at: int = 0    # tracks when next Reflection runs
         self._extract_at: int = 0    # tracks when next KnowledgeExtraction runs
         self._knowledge_extractor = None  # injected after construction
+        self._reflection_agent    = None  # injected after construction (friday/reasoning/reflection.py)
         self._searcher = None      # injected by terminal_chat for pre-search
         self._live_ctx = None      # LiveContextState — injected after construction
 
@@ -608,6 +631,17 @@ class AgentLoop:
         if memory_context:
             augmented_message = memory_context + f"\nUser: {user_message}"
 
+        # ── Self-Critique: correction detection gate (regex only — zero LLM cost if no match) ──
+        # Fires BEFORE context assembly so the lesson can influence the current response.
+        # create_task: non-blocking — correction is diagnosed in background.
+        if self._reflection_agent and len(self._history) > 2:
+            asyncio.create_task(
+                self._reflection_agent.check_for_correction(
+                    user_message = user_message,
+                    history      = list(self._history[-6:]),
+                )
+            )
+
         messages = self._assemble_context(augmented_message)
 
         self._persist("user", user_message)  # Persist original (not augmented)
@@ -616,6 +650,7 @@ class AgentLoop:
         response_content = None
         _tool_not_found: bool = False    # True when we exhaust retries for missing tool
         _missing_tool_strikes: int = 0  # consecutive "tool not found" counter (max 1 retry)
+        _failed_tool_name: str = ""     # populated when _tool_not_found fires — used by ReflectionAgent
 
         for step in range(max_steps):
             try:
@@ -639,8 +674,8 @@ class AgentLoop:
 
                 if not action:
                     # Clean exit — LLM gave a plain-text answer, no tool needed
-                    self._persist("assistant", content)
-                    response_content = content
+                    self._persist("assistant", content)                    # persist raw: thought stays in history for multi-step continuity
+                    response_content = _strip_thought_block(content)       # strip before returning to user
                     break
 
                 self._persist("assistant", content)
@@ -688,6 +723,7 @@ class AgentLoop:
                             f"[AgentLoop] Tool '{tool_name}' not registered on retry "
                             f"(step {step+1}/{max_steps}) — exiting loop for direct answer"
                         )
+                        _failed_tool_name = tool_name   # track for ReflectionAgent
                         _tool_not_found = True
                         break
 
@@ -727,6 +763,18 @@ class AgentLoop:
             except Exception as e:
                 logger.error(f"[AgentLoop] Direct fallback LLM call also failed: {e}")
                 response_content = "I don't have access to that right now, Sir."
+
+        # ── Self-Critique: fire Reflection agent when tool loop failed ────────────
+        # Only fires when _tool_not_found=True (real tool failure — not a clean loop exit).
+        # create_task: fire-and-forget, zero latency impact on response.
+        if self._reflection_agent and _tool_not_found:
+            asyncio.create_task(
+                self._reflection_agent.on_tool_failure(
+                    history         = list(self._history[-8:]),
+                    failed_tool     = _failed_tool_name,
+                    fallback_reason = "tool not available after retry",
+                )
+            )
 
         # Fire compaction in the background AFTER returning the response.
         # Zero impact on response latency. Summary cached for next turn.

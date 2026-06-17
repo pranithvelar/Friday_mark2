@@ -40,7 +40,7 @@ _SIMPLE_SYSTEM = (
     "with persistent memory. Answer in 1-2 sentences maximum. "
     "Use the provided context to give a personalized, memory-aware response. "
     "Never mention tags, tools, or that you are an AI. "
-    "Address the user by name if their name is known from the profile."
+    "Use the address form specified in user preferences — never deviate from it."
 )
 
 
@@ -331,9 +331,11 @@ class SimpleHandler:
         if self.personalization:
             prefs = self.personalization.profile.get("preferences", {})
             facts = self.personalization.profile.get("facts", {})
-            name = facts.get("name") or prefs.get("address_as")
-            if name:
-                user_rules.append(f'Address the user as "{name}".')
+            # address_as is the FINAL form of address — it wins over the real name always.
+            # Preference set explicitly by the user ("call me Sir") overrides stored name.
+            address_as = prefs.get("address_as") or facts.get("name")
+            if address_as:
+                user_rules.append(f'ALWAYS address the user as "{address_as}" — never use their real name, never deviate.')
             if prefs.get("response_style") == "concise":
                 user_rules.append("Be VERY concise. 1 sentence maximum. No elaboration.")
             if prefs.get("tone"):

@@ -85,6 +85,9 @@ class SmartRouter:
         # Pending plan store: {session_id: ExecutionPlan}
         # A plan lives here from 'awaiting_approval' until user says yes or no.
         self._pending_plans: dict = {}
+        # Per-session clarify counter: after 3 consecutive clarify responses,
+        # router auto-escalates to complex so Friday stops asking Qs and starts building.
+        self._clarify_count: dict = {}  # {session_id: int}
 
     def set_chronicle(self, chronicle: dict) -> None:
         """Inject project chronicle components after construction."""
@@ -290,20 +293,35 @@ class SmartRouter:
 
         # ── 3b. CLARIFY fast-path ──────────────────────────────────────
         # Router returned 'clarify' — request is complex but too vague to plan.
-        # Ask one targeted question immediately. No plan. No execution.
+        # Enforce MAX 3 clarify questions per session window.
+        # After 3, auto-escalate to complex so Friday stops asking and starts building.
         from friday.router.intent_classifier import QueryCategory
         if category == QueryCategory.CLARIFY:
+            count = self._clarify_count.get(session_id, 0) + 1
+            self._clarify_count[session_id] = count
+            if count >= 3:
+                # Auto-escalate: reset counter, route as complex
+                logger.info(
+                    f"[Router] Clarify limit reached ({count}/3) for session '{session_id}' "
+                    "— auto-escalating to complex"
+                )
+                self._clarify_count[session_id] = 0
+                return await self._route_complex(query, session_id, start, bundle)
             return await self._route_clarify(query, session_id, start, bundle)
 
         # ── 4. Route by complexity — ALL handlers receive the context bundle ───
         try:
             if complexity.value == "simple":
+                # Non-clarify response: reset clarify counter
+                self._clarify_count[session_id] = 0
                 result = await self._route_simple(query, category, session_id, start, bundle)
 
             elif complexity.value == "medium":
+                self._clarify_count[session_id] = 0
                 result = await self._route_medium(query, session_id, start, bundle)
 
             else:  # complex
+                self._clarify_count[session_id] = 0
                 result = await self._route_complex(query, session_id, start, bundle)
 
             # ── 4b. Append project clarification question if classifier was uncertain

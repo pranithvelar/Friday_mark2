@@ -15,7 +15,7 @@ from friday.router.smart_router import build_smart_router
 from friday.agents.friday.session import SessionManager
 from friday.memory.layers.layer_6_profile import UserPersonalization
 from friday.memory.layers.dreaming import MemoryDreamer
-from friday.memory.layers.promotion import promote_top_memories, prune_stale_entries, get_promotion_stats
+from friday.memory.layers.promotion import promote_top_memories, prune_stale_entries, get_promotion_stats, PromotionEngine
 from friday.memory.layers.layer_3_episodic import groom_facts, FactStore
 from friday.memory.pipeline import MemoryPipeline
 from friday.memory.context_assembler import ContextAssembler
@@ -122,13 +122,15 @@ async def main():
 
     # 11. Memory Pipeline — learns from EVERY input in background
     fact_store       = FactStore(db_manager)
+    promotion_engine = PromotionEngine(db_manager)   # adapter: wraps promote_top_memories + prune_stale_entries
     memory_pipeline  = MemoryPipeline(
         db_manager         = db_manager,
         personalization    = personalization,
         indexer            = indexer,
         fact_store         = fact_store,
+        promotion_engine   = promotion_engine,        # was None → now wired: promotes memories after every message
     )
-    print("[OK] Memory pipeline ready — continuous parallel learning active")
+    print("[OK] Memory pipeline ready — continuous parallel learning + promotion active")
 
     # 11b. Project Chronicle — JARVIS-style per-project documentation
     proj_registry   = ProjectRegistry(workspace)
@@ -192,6 +194,18 @@ async def main():
     )
     loop._knowledge_extractor = knowledge_extractor
     print("[OK] KnowledgeExtractor ready — deep learning active (every 20 messages)")
+
+    # 14b. Reflection Agent — Self-Critique: learns from Friday's own failures → Layer 5
+    # Triggered by: (a) tool failure after retry, (b) user correction keywords in message.
+    # Writes lessons to ProceduralMemory so ContextAssembler injects them next time.
+    from friday.reasoning.reflection import ReflectionAgent
+    reflection_agent = ReflectionAgent(
+        llm_provider      = llm_provider,
+        procedural_memory = procedural_memory,
+    )
+    loop._reflection_agent = reflection_agent
+    print("[OK] Reflection Agent ready — self-critique on failures + user corrections")
+
 
     # 15. Context Assembler — builds full context bundle for ALL route tiers
     context_assembler = ContextAssembler(
@@ -439,9 +453,11 @@ async def main():
     from friday.background.scheduler import BackgroundScheduler
     from friday.background.proactive_events import ProactiveEventsWatcher
     from friday.background.google_workspace import GoogleWorkspaceWatcher
+    from friday.background.memory_decay import MemoryDecayWatcher          # Layer 4 confidence decay
     bg_scheduler = BackgroundScheduler(db_manager, config)
     bg_scheduler.register_watcher(ProactiveEventsWatcher(workspace))
     bg_scheduler.register_watcher(GoogleWorkspaceWatcher())
+    bg_scheduler.register_watcher(MemoryDecayWatcher())                   # silent: runs every 6h, 45-day half-life
     bg_scheduler._llm_provider = llm_provider  # passed to watchers at runtime
     asyncio.create_task(bg_scheduler.run())
 
